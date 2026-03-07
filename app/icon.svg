@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <!-- Cup body: trapezoid wider at top, narrower at bottom -->
+  <path d="M4 7 L28 7 L23 27 L9 27 Z" fill="#dc2626" />
+  <!-- Rim band across the top -->
+  <rect x="4" y="5" width="24" height="4" rx="1.5" fill="#b91c1c" />
+  <!-- Subtle horizontal ridges for that solo cup look -->
+  <line x1="6.5" y1="14" x2="25.5" y2="14" stroke="#b91c1c" stroke-width="1.2" stroke-linecap="round" />
+  <line x1="8"   y1="20" x2="24"   y2="20" stroke="#b91c1c" stroke-width="1.2" stroke-linecap="round" />
+  <!-- Left-side shine for 3D depth -->
+  <path d="M7 9 L9.5 25 L7.5 25 Z" fill="rgba(255,255,255,0.18)" />
+</svg>
