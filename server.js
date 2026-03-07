@@ -248,6 +248,7 @@ io.on('connection', (socket) => {
     io.to(roomId).emit('throw-result', {
       success: result.success,
       removedCupId: result.removedCupId,
+      targetCupId,                        // broadcast so spectators can animate the ball
       room: serializeRoom(result.room),
     });
   });

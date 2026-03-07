@@ -41,6 +41,7 @@ function GamePageInner({ params }: PageProps) {
   const [statusMsg, setStatusMsg]   = useState('');
   const [copied, setCopied]         = useState(false);
   const [lastResult, setLastResult] = useState<'hit' | 'miss' | null>(null);
+  const [lastThrow,  setLastThrow]  = useState<{ cupId: number; hit: boolean } | null>(null);
 
   const pidRef = useRef('');
 
@@ -57,10 +58,13 @@ function GamePageInner({ params }: PageProps) {
     socket.on('game-started', (r: GameRoom) => {
       setRoom(r); setLastResult(null); setStatusMsg(''); setReconnecting(false);
     });
-    socket.on('throw-result', ({ room: r, success }: { room: GameRoom; success: boolean }) => {
+    socket.on('throw-result', ({
+      room: r, success, targetCupId,
+    }: { room: GameRoom; success: boolean; targetCupId: number }) => {
       setRoom(r);
       setLastResult(success ? 'hit' : 'miss');
-      setTimeout(() => setLastResult(null), 1800);
+      setLastThrow({ cupId: targetCupId, hit: success });
+      setTimeout(() => { setLastResult(null); setLastThrow(null); }, 2200);
     });
     socket.on('opponent-disconnected', (msg: string) => { setStatusMsg(msg); setReconnecting(true); });
     socket.on('opponent-reconnected',  ()             => { setStatusMsg(''); setReconnecting(false); });
@@ -338,7 +342,7 @@ function GamePageInner({ params }: PageProps) {
         cups={room.sharedCups}
         isMyTurn={isMyTurn}
         onThrow={handleThrow}
-        lastResult={lastResult}
+        lastThrow={lastThrow}
       />
 
       {/* ── Game log ────────────────────────────────────────────────────── */}
