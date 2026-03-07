@@ -8,7 +8,7 @@ export interface Cup {
 export interface Player {
   id: string;      // persistentId — stable across refreshes
   name: string;
-  cups: Cup[];
+  score: number;   // cups sunk this game
 }
 
 export interface TurnState {
@@ -20,15 +20,10 @@ export interface TurnState {
 export interface GameRoom {
   id: string;
   players: Player[];
+  sharedCups: Cup[];           // single shared pool for all players
   status: 'waiting' | 'playing' | 'finished';
   currentPlayerIndex: number;
   turnState: TurnState;
-  winner: string | null;  // persistentId of winner
+  winner: string | null;       // persistentId of winner
   gameLog: string[];
-}
-
-export interface ThrowResult {
-  success: boolean;
-  removedCupId: number | null;
-  room: GameRoom;
 }

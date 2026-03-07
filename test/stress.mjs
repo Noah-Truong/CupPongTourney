@@ -1,10 +1,11 @@
 /**
- * Cup Pong Stress Test Suite
- * Tests: 3+ players per room, turn logic, win conditions, concurrent rooms, reconnection
+ * Cup Pong Stress Test Suite — updated for shared cup pool + drag-to-throw API
+ * Tests: room creation, multi-player lobby, turn logic, win condition, concurrent rooms,
+ *        rematch, disconnect grace, edge-case rejections, room expiry
  */
 
 import { io } from 'socket.io-client';
-import { v4 as uuidv4 } from 'uuid';
+import { randomUUID } from 'crypto';
 
 const SERVER = 'http://localhost:3000';
 const PASS = '\x1b[32m✓\x1b[0m';
@@ -15,29 +16,24 @@ let passed = 0;
 let failed = 0;
 
 function assert(condition, label) {
-  if (condition) {
-    console.log(`  ${PASS} ${label}`);
-    passed++;
-  } else {
-    console.log(`  ${FAIL} ${label}`);
-    failed++;
-  }
+  if (condition) { console.log(`  ${PASS} ${label}`); passed++; }
+  else           { console.log(`  ${FAIL} ${label}`); failed++; }
 }
 
 function makeClient() {
   return io(SERVER, { autoConnect: true, forceNew: true, timeout: 5000 });
 }
 
-function waitFor(socket, event, timeout = 4000) {
+function waitFor(socket, event, timeout = 5000) {
   return new Promise((resolve, reject) => {
     const t = setTimeout(() => reject(new Error(`Timeout waiting for "${event}"`)), timeout);
     socket.once(event, (data) => { clearTimeout(t); resolve(data); });
   });
 }
 
-function waitForAny(socket, events, timeout = 4000) {
+function waitForAny(socket, events, timeout = 5000) {
   return new Promise((resolve, reject) => {
-    const t = setTimeout(() => reject(new Error(`Timeout waiting for ${events.join('/')}`)), timeout);
+    const t = setTimeout(() => reject(new Error(`Timeout: ${events.join('/')}`)), timeout);
     const cleanup = () => { clearTimeout(t); events.forEach(e => socket.off(e)); };
     events.forEach(e => socket.once(e, (data) => { cleanup(); resolve({ event: e, data }); }));
   });
@@ -45,164 +41,189 @@ function waitForAny(socket, events, timeout = 4000) {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// ─── Test 1: Basic room creation ──────────────────────────────────────────────
+/**
+ * Helper: create a room, have N players join, then host starts the game.
+ * Returns { roomId, room (game-started state), clients, pids }
+ */
+async function setupGame(playerNames) {
+  const clients = [];
+  const pids    = [];
+
+  for (let i = 0; i < playerNames.length; i++) {
+    const c = makeClient();
+    await waitFor(c, 'connect');
+    clients.push(c);
+    pids.push(randomUUID());
+  }
+
+  clients[0].emit('create-room', playerNames[0], pids[0]);
+  const created = await waitFor(clients[0], 'room-created');
+  const roomId  = created.id;
+
+  for (let i = 1; i < playerNames.length; i++) {
+    clients[i].emit('join-room', roomId, playerNames[i], pids[i]);
+    await waitFor(clients[i], 'room-joined');
+  }
+
+  // Host starts the game
+  const startedPromises = clients.map(c => waitFor(c, 'game-started'));
+  clients[0].emit('start-game', roomId, pids[0]);
+  const startedRooms = await Promise.all(startedPromises);
+  const room = startedRooms[0];
+
+  return { roomId, room, clients, pids };
+}
+
+// ─── Test 1: Room creation ─────────────────────────────────────────────────────
 async function testRoomCreation() {
   console.log('\n\x1b[1mTest 1: Room Creation\x1b[0m');
   const c = makeClient();
   await waitFor(c, 'connect');
 
-  const pid = uuidv4();
-  c.emit('create-room', 'Alice', pid);
+  c.emit('create-room', 'Alice', randomUUID());
   const room = await waitFor(c, 'room-created');
 
-  assert(room.id && room.id.length === 6, `Room has 6-char ID: "${room.id}"`);
-  assert(room.players.length === 1, 'Room has exactly 1 player');
-  assert(room.players[0].name === 'Alice', 'Player name is Alice');
-  assert(room.status === 'waiting', 'Room status is waiting');
-  assert(room.players[0].cups.length === 10, 'Player has 10 cups');
+  assert(room.id?.length === 6,          `Room has 6-char ID: "${room.id}"`);
+  assert(room.players.length === 1,      'Room has 1 player');
+  assert(room.players[0].name === 'Alice','Player name is Alice');
+  assert(room.status === 'waiting',      'Room status is waiting');
+  assert(Array.isArray(room.sharedCups), 'sharedCups is array');
+  assert(room.sharedCups.length === 0,   'Cups empty until game starts');
+  assert(room.players[0].score === 0,    'Player score starts at 0');
 
   c.disconnect();
-  return room.id;
 }
 
 // ─── Test 2: Two players start a game ─────────────────────────────────────────
 async function testTwoPlayerGame() {
   console.log('\n\x1b[1mTest 2: Two-Player Game Start\x1b[0m');
-  const c1 = makeClient();
-  const c2 = makeClient();
-  await Promise.all([waitFor(c1, 'connect'), waitFor(c2, 'connect')]);
+  const { room, clients } = await setupGame(['Player1', 'Player2']);
 
-  const pid1 = uuidv4();
-  const pid2 = uuidv4();
+  assert(room.status === 'playing',            'Room status is playing');
+  assert(room.players.length === 2,            'Both players present');
+  assert(room.currentPlayerIndex === 0,        'Player 1 goes first');
+  // 2 players → baseCount = 4 → 4+3+2+1 = 10 cups
+  assert(room.sharedCups.length === 10,        'Shared pool has 10 cups (2 players)');
+  assert(room.sharedCups.every(c => !c.removed),'All cups start intact');
+  assert(room.players.every(p => p.score === 0),'All scores start at 0');
 
-  c1.emit('create-room', 'Player1', pid1);
-  const room = await waitFor(c1, 'room-created');
-  const roomId = room.id;
-
-  c2.emit('join-room', roomId, 'Player2', pid2);
-  const [started1, started2] = await Promise.all([
-    waitFor(c1, 'game-started'),
-    waitFor(c2, 'game-started'),
-  ]);
-
-  assert(started1.status === 'playing', 'Room status is playing (P1 view)');
-  assert(started2.status === 'playing', 'Room status is playing (P2 view)');
-  assert(started1.players.length === 2, 'Both players present');
-  assert(started1.currentPlayerIndex === 0, 'Player 1 goes first');
-  assert(started1.players[0].cups.length === 10, 'P1 has 10 cups');
-  assert(started1.players[1].cups.length === 10, 'P2 has 10 cups');
-
-  c1.disconnect();
-  c2.disconnect();
-  return { roomId, pid1, pid2 };
+  clients.forEach(c => c.disconnect());
 }
 
-// ─── Test 3: Third player rejected ────────────────────────────────────────────
-async function testThirdPlayerRejected() {
-  console.log('\n\x1b[1mTest 3: Third Player Cannot Join Full Room\x1b[0m');
-  const c1 = makeClient();
-  const c2 = makeClient();
-  const c3 = makeClient();
-  await Promise.all([waitFor(c1, 'connect'), waitFor(c2, 'connect'), waitFor(c3, 'connect')]);
+// ─── Test 3: Three-player room ────────────────────────────────────────────────
+async function testThreePlayerRoom() {
+  console.log('\n\x1b[1mTest 3: Three-Player Room\x1b[0m');
+  const { room, clients } = await setupGame(['P1', 'P2', 'P3']);
 
-  c1.emit('create-room', 'P1', uuidv4());
-  const room = await waitFor(c1, 'room-created');
-  const roomId = room.id;
+  assert(room.status === 'playing',       'Game started with 3 players');
+  assert(room.players.length === 3,       'All 3 players present');
+  // 3 players → baseCount = 5 → 5+4+3+2+1 = 15 cups
+  assert(room.sharedCups.length === 15,   'Shared pool has 15 cups (3 players)');
 
-  c2.emit('join-room', roomId, 'P2', uuidv4());
-  await waitFor(c2, 'game-started');
-
-  // Third player tries to join
-  c3.emit('join-room', roomId, 'P3', uuidv4());
-  const result = await waitForAny(c3, ['game-started', 'error']);
-
-  assert(result.event === 'error', 'Third player receives error');
-  assert(result.data === 'Room is full.', `Error message is "Room is full." (got: "${result.data}")`);
-
-  // Fourth player tries with a fake room code
-  const c4 = makeClient();
-  await waitFor(c4, 'connect');
-  c4.emit('join-room', 'ZZZZZZ', 'P4', uuidv4());
-  const r4 = await waitForAny(c4, ['game-started', 'error']);
-  assert(r4.event === 'error', 'Player with bad code receives error');
-  assert(r4.data.includes('not found'), `Error mentions "not found" (got: "${r4.data}")`);
-
-  c1.disconnect(); c2.disconnect(); c3.disconnect(); c4.disconnect();
+  clients.forEach(c => c.disconnect());
 }
 
-// ─── Test 4: Turn logic — 2 balls per turn, correct switching ─────────────────
-async function testTurnLogic() {
-  console.log('\n\x1b[1mTest 4: Turn Logic (2 balls, turn switching)\x1b[0m');
-  const c1 = makeClient();
-  const c2 = makeClient();
+// ─── Test 4: Player cannot join after game starts ─────────────────────────────
+async function testJoinRejectedAfterStart() {
+  console.log('\n\x1b[1mTest 4: Cannot Join In-Progress Game\x1b[0m');
+  const { roomId, clients } = await setupGame(['H', 'G']);
+
+  const late = makeClient();
+  await waitFor(late, 'connect');
+  late.emit('join-room', roomId, 'Late', randomUUID());
+  const result = await waitForAny(late, ['room-joined', 'error']);
+
+  assert(result.event === 'error',                        'Late joiner receives error');
+  assert(result.data.includes('already in progress'),     `Error: "${result.data}"`);
+
+  // Bad room code
+  const ghost = makeClient();
+  await waitFor(ghost, 'connect');
+  ghost.emit('join-room', 'ZZZZZZ', 'Ghost', randomUUID());
+  const r2 = await waitForAny(ghost, ['room-joined', 'error']);
+  assert(r2.event === 'error',       'Bad code → error');
+  assert(r2.data.includes('not found'), `Error mentions "not found": "${r2.data}"`);
+
+  clients.forEach(c => c.disconnect());
+  late.disconnect();
+  ghost.disconnect();
+}
+
+// ─── Test 5: Only host can start ──────────────────────────────────────────────
+async function testOnlyHostCanStart() {
+  console.log('\n\x1b[1mTest 5: Only Host Can Start Game\x1b[0m');
+  const c1 = makeClient(), c2 = makeClient();
   await Promise.all([waitFor(c1, 'connect'), waitFor(c2, 'connect')]);
+  const pid1 = randomUUID(), pid2 = randomUUID();
 
-  const pid1 = uuidv4();
-  c1.emit('create-room', 'Thrower', pid1);
+  c1.emit('create-room', 'Host', pid1);
   const room = await waitFor(c1, 'room-created');
-  c2.emit('join-room', room.id, 'Receiver', uuidv4());
-  const started = await waitFor(c1, 'game-started');
-  const roomId = started.id;
+  c2.emit('join-room', room.id, 'Guest', pid2);
+  await waitFor(c2, 'room-joined');
 
-  // Get opponent's first available cup
-  const opponentCups = started.players[1].cups.filter(c => !c.removed);
-  const cup0 = opponentCups[0].id;
-  const cup1 = opponentCups[1].id;
-
-  // Throw ball 1 (miss intentionally with high meter value)
-  c1.emit('throw-ball', roomId, cup0, 99);
-  const r1 = await waitFor(c1, 'throw-result');
-  assert(r1.room.turnState.ballsThrown === 1, 'After ball 1: ballsThrown = 1');
-  assert(r1.room.currentPlayerIndex === 0, 'Still P1 turn after first throw');
-
-  // Throw ball 2
-  c1.emit('throw-ball', roomId, cup1, 99);
-  const r2 = await waitFor(c1, 'throw-result');
-  assert(r2.room.turnState.ballsThrown === 0, 'After ball 2: ballsThrown resets to 0');
-  assert(r2.room.currentPlayerIndex === 1, 'Turn switches to P2 after 2 throws');
-
-  // P1 tries to throw on P2's turn — should get error
+  // Non-host tries to start
   let errorReceived = false;
-  c1.once('error', () => { errorReceived = true; });
-  c1.emit('throw-ball', roomId, cup0, 50);
+  c2.once('error', () => { errorReceived = true; });
+  c2.emit('start-game', room.id, pid2);
   await sleep(500);
-  assert(errorReceived, 'P1 cannot throw during P2 turn — gets error');
+  assert(errorReceived, 'Non-host gets error when trying to start');
 
   c1.disconnect(); c2.disconnect();
 }
 
-// ─── Test 5: Bonus turn when both balls go in ─────────────────────────────────
-async function testBonusTurn() {
-  console.log('\n\x1b[1mTest 5: Bonus Turn (both balls sunk)\x1b[0m');
+// ─── Test 6: Turn logic — 2 balls per turn ────────────────────────────────────
+async function testTurnLogic() {
+  console.log('\n\x1b[1mTest 6: Turn Logic (2 balls, switching)\x1b[0m');
+  const { roomId, room, clients } = await setupGame(['Thrower', 'Receiver']);
+  const [c1, c2] = clients;
 
-  // We force success by throwing at meterValue=1 repeatedly until we get 2 makes in a turn
-  // Try up to 20 games to hit a bonus turn
+  const cup0 = room.sharedCups[0].id;
+  const cup1 = room.sharedCups[1].id;
+  const cup2 = room.sharedCups[2].id;
+
+  // Ball 1 with 0.0 accuracy → almost certain miss (5% hit chance)
+  c1.emit('throw-ball', roomId, cup0, 0.0);
+  const r1 = await waitFor(c1, 'throw-result');
+  assert(r1.room.turnState.ballsThrown === 1, 'After ball 1: ballsThrown = 1');
+  assert(r1.room.currentPlayerIndex === 0,    'Still P1 turn after first throw');
+
+  // Ball 2
+  c1.emit('throw-ball', roomId, cup1, 0.0);
+  const r2 = await waitFor(c1, 'throw-result');
+  assert(r2.room.turnState.ballsThrown === 0,   'After ball 2: ballsThrown resets');
+  assert(r2.room.currentPlayerIndex === 1,      'Turn switches to P2');
+
+  // P1 tries to throw on P2's turn → error
+  let errReceived = false;
+  c1.once('error', () => { errReceived = true; });
+  c1.emit('throw-ball', roomId, cup2, 0.5);
+  await sleep(400);
+  assert(errReceived, 'P1 cannot throw during P2 turn');
+
+  c1.disconnect(); c2.disconnect();
+}
+
+// ─── Test 7: Bonus turn when both balls sink ──────────────────────────────────
+async function testBonusTurn() {
+  console.log('\n\x1b[1mTest 7: Bonus Turn (both balls sunk)\x1b[0m');
   let bonusTurnSeen = false;
 
   for (let attempt = 0; attempt < 20 && !bonusTurnSeen; attempt++) {
-    const c1 = makeClient();
-    const c2 = makeClient();
-    await Promise.all([waitFor(c1, 'connect'), waitFor(c2, 'connect')]);
+    const { roomId, room, clients } = await setupGame(['BonusA', 'BonusB']);
+    const [c1, c2] = clients;
+    const cups = room.sharedCups.filter(c => !c.removed);
 
-    c1.emit('create-room', 'BonusTest', uuidv4());
-    const room = await waitFor(c1, 'room-created');
-    c2.emit('join-room', room.id, 'Opp', uuidv4());
-    const started = await waitFor(c1, 'game-started');
-    const roomId = started.id;
-    const cups = started.players[1].cups;
-
-    c1.emit('throw-ball', roomId, cups[0].id, 1); // near-perfect (95% chance)
+    c1.emit('throw-ball', roomId, cups[0].id, 1.0); // 95% hit
     const r1 = await waitFor(c1, 'throw-result');
 
     if (r1.success) {
-      c1.emit('throw-ball', roomId, cups[1].id, 1);
+      c1.emit('throw-ball', roomId, cups[1].id, 1.0);
       const r2 = await waitFor(c1, 'throw-result');
 
-      if (r2.success) {
-        // Both made — should be bonus turn, still P1's turn
-        assert(r2.room.currentPlayerIndex === 0, 'Bonus turn: still P1 after sinking both');
-        assert(r2.room.turnState.bonusTurn === true, 'bonusTurn flag is true');
-        assert(r2.room.turnState.ballsThrown === 0, 'Balls reset for bonus turn');
+      if (r2.success && r2.room.status !== 'finished') {
+        assert(r2.room.currentPlayerIndex === 0, 'Bonus turn: still P1');
+        assert(r2.room.turnState.bonusTurn === true, 'bonusTurn flag set');
+        assert(r2.room.turnState.ballsThrown === 0,  'Balls reset for bonus');
         bonusTurnSeen = true;
       }
     }
@@ -210,155 +231,111 @@ async function testBonusTurn() {
     c1.disconnect(); c2.disconnect();
   }
 
-  if (!bonusTurnSeen) {
-    assert(false, 'Could not trigger bonus turn in 20 attempts (probability issue?)');
-  }
+  if (!bonusTurnSeen) assert(false, 'Could not trigger bonus turn in 20 attempts');
 }
 
-// ─── Test 6: Win condition ─────────────────────────────────────────────────────
+// ─── Test 8: Win condition — shared pool drained ──────────────────────────────
 async function testWinCondition() {
-  console.log('\n\x1b[1mTest 6: Win Condition\x1b[0m');
-  const c1 = makeClient();
-  const c2 = makeClient();
-  await Promise.all([waitFor(c1, 'connect'), waitFor(c2, 'connect')]);
+  console.log('\n\x1b[1mTest 8: Win Condition (shared pool drained)\x1b[0m');
+  const { roomId, room, clients } = await setupGame(['Winner', 'Loser']);
+  const [c1, c2] = clients;
 
-  c1.emit('create-room', 'Winner', uuidv4());
-  const room = await waitFor(c1, 'room-created');
-  c2.emit('join-room', room.id, 'Loser', uuidv4());
-  const started = await waitFor(c1, 'game-started');
-  const roomId = started.id;
+  let currentRoom = room;
+  let bail = 0;
 
-  // Manually drain all 10 of P2's cups by throwing with meterValue=1 until each sinks
-  let currentRoom = started;
-  let ballsInTurn = 0;
+  while (currentRoom.status !== 'finished' && bail < 500) {
+    const isP1Turn = currentRoom.currentPlayerIndex === 0;
+    const client   = isP1Turn ? c1 : c2;
+    const cups     = currentRoom.sharedCups.filter(c => !c.removed);
+    if (cups.length === 0) break;
 
-  while (true) {
-    const remaining = currentRoom.players[1].cups.filter(c => !c.removed);
-    if (remaining.length === 0) break;
-
-    const cup = remaining[0];
-    c1.emit('throw-ball', roomId, cup.id, 1);
-    const result = await waitFor(c1, 'throw-result');
-    currentRoom = result.room;
-    ballsInTurn++;
-
-    if (currentRoom.status === 'finished') break;
-
-    // If turn ended (ballsThrown reset and still has cups), it's P2's turn — skip their balls
-    if (currentRoom.currentPlayerIndex === 1 && currentRoom.turnState.ballsThrown === 0) {
-      const p1cups = currentRoom.players[0].cups.filter(c => !c.removed);
-      // P2 throws into a removed or nonexistent cup — just throw and let server handle
-      if (p1cups.length > 0) {
-        c2.emit('throw-ball', roomId, p1cups[0].id, 99);
-        const pr1 = await waitFor(c2, 'throw-result');
-        currentRoom = pr1.room;
-        if (currentRoom.status === 'finished') break;
-        if (currentRoom.currentPlayerIndex === 1) {
-          c2.emit('throw-ball', roomId, p1cups[p1cups.length > 1 ? 1 : 0].id, 99);
-          const pr2 = await waitFor(c2, 'throw-result');
-          currentRoom = pr2.room;
-          if (currentRoom.status === 'finished') break;
-        }
-      }
-    }
-
-    // Safety: bail after many rounds
-    if (ballsInTurn > 200) break;
+    const accuracy = isP1Turn ? 1.0 : 0.0; // P1 always hits, P2 always misses
+    client.emit('throw-ball', roomId, cups[0].id, accuracy);
+    const r = await waitFor(client, 'throw-result');
+    currentRoom = r.room;
+    bail++;
   }
 
   assert(currentRoom.status === 'finished', 'Game reaches finished status');
-  assert(currentRoom.winner !== null, 'Winner is set');
+  assert(currentRoom.winner !== null,       'Winner is set');
+  assert(
+    currentRoom.sharedCups.every(c => c.removed),
+    'All shared cups removed when game ends'
+  );
+  const winnerPlayer = currentRoom.players.find(p => p.id === currentRoom.winner);
+  assert(winnerPlayer?.score > 0, `Winner sank at least 1 cup (scored ${winnerPlayer?.score})`);
 
   c1.disconnect(); c2.disconnect();
 }
 
-// ─── Test 7: Concurrent rooms don't interfere ─────────────────────────────────
+// ─── Test 9: Concurrent rooms don't interfere ─────────────────────────────────
 async function testConcurrentRooms() {
-  console.log('\n\x1b[1mTest 7: Concurrent Rooms Isolation\x1b[0m');
+  console.log('\n\x1b[1mTest 9: Concurrent Rooms Isolation\x1b[0m');
   const ROOM_COUNT = 5;
-  const clients = [];
-  const rooms = [];
+  const allClients = [];
+  const roomIds    = [];
+  const rooms      = [];
 
-  for (let i = 0; i < ROOM_COUNT * 2; i++) {
-    const c = makeClient();
-    await waitFor(c, 'connect');
-    clients.push(c);
-  }
-
-  // Create ROOM_COUNT rooms — set up each listener before emitting to avoid race
+  // Set up ROOM_COUNT independent 2-player games
   for (let i = 0; i < ROOM_COUNT; i++) {
-    const p = waitFor(clients[i * 2], 'room-created');
-    clients[i * 2].emit('create-room', `Host${i}`, uuidv4());
-    const room = await p;
-    rooms.push(room.id);
+    const result = await setupGame([`H${i}`, `G${i}`]);
+    allClients.push(...result.clients);
+    roomIds.push(result.roomId);
+    rooms.push(result.room);
   }
 
-  assert(new Set(rooms).size === ROOM_COUNT, `All ${ROOM_COUNT} rooms have unique IDs`);
+  assert(new Set(roomIds).size === ROOM_COUNT, `All ${ROOM_COUNT} rooms have unique IDs`);
 
-  // Join all rooms simultaneously
-  const joinPromises = [];
-  for (let i = 0; i < ROOM_COUNT; i++) {
-    clients[i * 2 + 1].emit('join-room', rooms[i], `Guest${i}`, uuidv4());
-    joinPromises.push(waitFor(clients[i * 2], 'game-started'));
-  }
-
-  const startedRooms = await Promise.all(joinPromises);
-  assert(startedRooms.every(r => r.status === 'playing'), `All ${ROOM_COUNT} rooms started independently`);
-
-  // Throw in room 0, verify only room 0 sees the throw-result
+  // Throw in room 0, verify other rooms don't see the event
   let wrongRoomGotEvent = false;
   for (let i = 1; i < ROOM_COUNT; i++) {
-    clients[i * 2].once('throw-result', () => { wrongRoomGotEvent = true; });
+    allClients[i * 2].once('throw-result', () => { wrongRoomGotEvent = true; });
   }
 
-  const room0 = startedRooms[0];
-  const cup = room0.players[1].cups[0];
-  clients[0].emit('throw-ball', room0.id, cup.id, 50);
-  await waitFor(clients[0], 'throw-result');
+  const r0 = rooms[0];
+  const cup = r0.sharedCups.find(c => !c.removed);
+  allClients[0].emit('throw-ball', r0.id, cup.id, 0.5);
+  await waitFor(allClients[0], 'throw-result');
   await sleep(300);
 
-  assert(!wrongRoomGotEvent, 'throw-result is isolated to the correct room');
+  assert(!wrongRoomGotEvent, 'throw-result isolated to correct room');
 
-  clients.forEach(c => c.disconnect());
+  allClients.forEach(c => c.disconnect());
 }
 
-// ─── Test 8: Rematch resets state ─────────────────────────────────────────────
+// ─── Test 10: Rematch resets state ────────────────────────────────────────────
 async function testRematch() {
-  console.log('\n\x1b[1mTest 8: Rematch Resets Game State\x1b[0m');
-  const c1 = makeClient();
-  const c2 = makeClient();
-  await Promise.all([waitFor(c1, 'connect'), waitFor(c2, 'connect')]);
+  console.log('\n\x1b[1mTest 10: Rematch Resets State\x1b[0m');
+  const { roomId, room, clients } = await setupGame(['A', 'B']);
+  const [c1, c2] = clients;
 
-  c1.emit('create-room', 'A', uuidv4());
-  const room = await waitFor(c1, 'room-created');
-  c2.emit('join-room', room.id, 'B', uuidv4());
-  const started = await waitFor(c1, 'game-started');
-  const roomId = started.id;
-
-  // Drain all P2 cups quickly
-  let currentRoom = started;
+  let currentRoom = room;
   let bail = 0;
   while (currentRoom.status !== 'finished' && bail < 300) {
     const isP1Turn = currentRoom.currentPlayerIndex === 0;
-    const client = isP1Turn ? c1 : c2;
-    const targetPlayerIdx = isP1Turn ? 1 : 0;
-    const cups = currentRoom.players[targetPlayerIdx].cups.filter(c => !c.removed);
+    const client   = isP1Turn ? c1 : c2;
+    const cups     = currentRoom.sharedCups.filter(c => !c.removed);
     if (cups.length === 0) break;
-    client.emit('throw-ball', roomId, cups[0].id, isP1Turn ? 1 : 99);
-    const r = await waitFor(isP1Turn ? c1 : c2, 'throw-result');
+    client.emit('throw-ball', roomId, cups[0].id, 1.0);
+    const r = await waitFor(client, 'throw-result');
     currentRoom = r.room;
     bail++;
   }
 
   if (currentRoom.status === 'finished') {
     c1.emit('rematch', roomId);
-    const [r1, r2] = await Promise.all([waitFor(c1, 'game-started'), waitFor(c2, 'game-started')]);
-    assert(r1.status === 'playing', 'Rematch: room back to playing');
-    assert(r1.players[0].cups.length === 10, 'P1 cups reset to 10');
-    assert(r1.players[1].cups.length === 10, 'P2 cups reset to 10');
-    assert(r1.winner === null, 'Winner cleared');
-    assert(r1.currentPlayerIndex === 0, 'P1 goes first again');
-    assert(r2.status === 'playing', 'Both clients see rematch start');
+    const [r1, r2] = await Promise.all([
+      waitFor(c1, 'game-started'),
+      waitFor(c2, 'game-started'),
+    ]);
+    assert(r1.status === 'playing',                'Rematch: room back to playing');
+    // 2 players → 10 cups
+    assert(r1.sharedCups.length === 10,            'Shared pool refilled (10 cups)');
+    assert(r1.sharedCups.every(c => !c.removed),   'All cups fresh for rematch');
+    assert(r1.players.every(p => p.score === 0),   'Scores reset to 0');
+    assert(r1.winner === null,                     'Winner cleared');
+    assert(r1.currentPlayerIndex === 0,            'P1 goes first again');
+    assert(r2.status === 'playing',                'Both clients see rematch');
   } else {
     console.log(`  ${INFO} Game didn't finish in bail limit — skipping rematch assertions`);
   }
@@ -366,142 +343,111 @@ async function testRematch() {
   c1.disconnect(); c2.disconnect();
 }
 
-// ─── Test 9: Disconnect + grace period ────────────────────────────────────────
+// ─── Test 11: Disconnect + grace period ───────────────────────────────────────
 async function testDisconnectGrace() {
-  console.log('\n\x1b[1mTest 9: Disconnect Grace Period\x1b[0m');
-  const c1 = makeClient();
-  const c2 = makeClient();
-  await Promise.all([waitFor(c1, 'connect'), waitFor(c2, 'connect')]);
+  console.log('\n\x1b[1mTest 11: Disconnect Grace Period\x1b[0m');
+  const { room, clients } = await setupGame(['Grace1', 'Grace2']);
+  const [c1, c2] = clients;
 
-  c1.emit('create-room', 'Grace1', uuidv4());
-  const room = await waitFor(c1, 'room-created');
-  c2.emit('join-room', room.id, 'Grace2', uuidv4());
-  await waitFor(c1, 'game-started');
-
-  // Disconnect P1 suddenly
   let disconnectMsgReceived = false;
   c2.once('opponent-disconnected', () => { disconnectMsgReceived = true; });
   c1.disconnect();
   await sleep(1000);
 
-  assert(disconnectMsgReceived, 'P2 receives opponent-disconnected event within 1s');
-  console.log(`  ${INFO} Room should stay alive for 15s grace period`);
+  assert(disconnectMsgReceived, 'P2 receives opponent-disconnected within 1s');
+  console.log(`  ${INFO} Room stays alive for 15s grace period`);
 
-  // Reconnect P1 within grace period
+  // Reconnect within grace period
   const c1b = makeClient();
   await waitFor(c1b, 'connect');
 
-  let reconnectMsgReceived = false;
-  c2.once('opponent-reconnected', () => { reconnectMsgReceived = true; });
+  let reconnectReceived = false;
+  c2.once('opponent-reconnected', () => { reconnectReceived = true; });
 
   c1b.emit('get-room', room.id, room.players[0].id);
-  const roomState = await waitForAny(c1b, ['room-state', 'error']);
-
-  assert(roomState.event === 'room-state', 'Reconnected player gets room-state');
+  const result = await waitForAny(c1b, ['room-state', 'error']);
+  assert(result.event === 'room-state', 'Reconnected player gets room-state');
   await sleep(500);
-  assert(reconnectMsgReceived, 'P2 receives opponent-reconnected event');
+  assert(reconnectReceived, 'P2 receives opponent-reconnected');
 
   c1b.disconnect(); c2.disconnect();
 }
 
-// ─── Test 10: Throwing a 3rd ball is rejected ────────────────────────────────
+// ─── Test 12: Over-throw rejected (3rd ball) ──────────────────────────────────
 async function testOverThrowRejected() {
-  console.log('\n\x1b[1mTest 10: Over-throw Rejected (3rd ball)\x1b[0m');
-  const c1 = makeClient();
-  const c2 = makeClient();
-  await Promise.all([waitFor(c1, 'connect'), waitFor(c2, 'connect')]);
+  console.log('\n\x1b[1mTest 12: 3rd Ball Rejected\x1b[0m');
+  const { roomId, room, clients } = await setupGame(['Spammer', 'Opp']);
+  const [c1] = clients;
+  const cups = room.sharedCups;
 
-  c1.emit('create-room', 'Spammer', uuidv4());
-  const room = await waitFor(c1, 'room-created');
-  c2.emit('join-room', room.id, 'Opp', uuidv4());
-  const started = await waitFor(c1, 'game-started');
-  const roomId = started.id;
-  const cups = started.players[1].cups;
-
-  c1.emit('throw-ball', roomId, cups[0].id, 99);
+  c1.emit('throw-ball', roomId, cups[0].id, 0.0);
   await waitFor(c1, 'throw-result');
-  c1.emit('throw-ball', roomId, cups[1].id, 99);
+  c1.emit('throw-ball', roomId, cups[1].id, 0.0);
   await waitFor(c1, 'throw-result');
 
-  // 3rd throw — should error
   let errorReceived = false;
   c1.once('error', () => { errorReceived = true; });
-  c1.emit('throw-ball', roomId, cups[2].id, 99);
-  await sleep(500);
-  assert(errorReceived, '3rd throw in same turn is rejected with error');
+  c1.emit('throw-ball', roomId, cups[2].id, 0.0);
+  await sleep(400);
+  assert(errorReceived, '3rd throw in same turn is rejected');
 
-  c1.disconnect(); c2.disconnect();
+  clients.forEach(c => c.disconnect());
 }
 
-// ─── Test 11: Targeting already-removed cup is rejected ───────────────────────
+// ─── Test 13: Targeting removed cup rejected ──────────────────────────────────
 async function testRemovedCupRejected() {
-  console.log('\n\x1b[1mTest 11: Targeting a Removed Cup is Rejected\x1b[0m');
-  // Force-sink a cup at meter=1 (95% hit rate), retry until it sinks
+  console.log('\n\x1b[1mTest 13: Removed Cup Rejected\x1b[0m');
   let succeeded = false;
-  for (let attempt = 0; attempt < 10 && !succeeded; attempt++) {
-    const c1 = makeClient();
-    const c2 = makeClient();
-    await Promise.all([waitFor(c1, 'connect'), waitFor(c2, 'connect')]);
 
-    c1.emit('create-room', 'Sniper', uuidv4());
-    const room = await waitFor(c1, 'room-created');
-    c2.emit('join-room', room.id, 'Target', uuidv4());
-    const started = await waitFor(c1, 'game-started');
-    const roomId = started.id;
-    const cup = started.players[1].cups[0];
+  for (let attempt = 0; attempt < 15 && !succeeded; attempt++) {
+    const { roomId, room, clients } = await setupGame(['Sniper', 'Target']);
+    const [c1] = clients;
+    const cup = room.sharedCups[0];
 
-    c1.emit('throw-ball', roomId, cup.id, 1);
+    c1.emit('throw-ball', roomId, cup.id, 1.0);
     const r1 = await waitFor(c1, 'throw-result');
 
     if (r1.success) {
-      // Cup is now removed — try to target it again with ball 2
       let errorReceived = false;
       c1.once('error', () => { errorReceived = true; });
-      c1.emit('throw-ball', roomId, cup.id, 1);
-      await sleep(500);
-      assert(errorReceived, 'Targeting an already-removed cup is rejected');
+      c1.emit('throw-ball', roomId, cup.id, 1.0); // target same (now removed) cup
+      await sleep(400);
+      assert(errorReceived, 'Targeting removed cup is rejected');
       succeeded = true;
     }
 
-    c1.disconnect(); c2.disconnect();
+    clients.forEach(c => c.disconnect());
   }
-  if (!succeeded) {
-    console.log(`  ${INFO} Could not sink a cup in 10 attempts to test removed cup rejection`);
-  }
+
+  if (!succeeded) console.log(`  ${INFO} Could not sink a cup in 15 attempts`);
 }
 
-// ─── Test 12: Room expires after grace period ─────────────────────────────────
+// ─── Test 14: Room expires after grace ────────────────────────────────────────
 async function testRoomExpiresAfterGrace() {
-  console.log('\n\x1b[1mTest 12: Room Expires After Grace Period\x1b[0m');
-  console.log(`  ${INFO} This test waits 16s for the 15s grace period to expire...`);
-  const c1 = makeClient();
-  const c2 = makeClient();
-  await Promise.all([waitFor(c1, 'connect'), waitFor(c2, 'connect')]);
+  console.log('\n\x1b[1mTest 14: Room Expires After Grace Period\x1b[0m');
+  console.log(`  ${INFO} Waits 16s for the 15s grace period to expire…`);
 
-  c1.emit('create-room', 'Leaver', uuidv4());
-  const room = await waitFor(c1, 'room-created');
-  c2.emit('join-room', room.id, 'Waiter', uuidv4());
-  await waitFor(c1, 'game-started');
+  const { room, clients } = await setupGame(['Leaver', 'Waiter']);
+  const [c1, c2] = clients;
 
   let playerLeftReceived = false;
   c2.once('player-left', () => { playerLeftReceived = true; });
 
-  c1.disconnect(); // abruptly leave — don't reconnect
-  await sleep(16_000); // wait past the 15s grace period
+  c1.disconnect();
+  await sleep(16_000);
 
-  assert(playerLeftReceived, 'P2 receives player-left after grace period expires');
+  assert(playerLeftReceived, 'P2 receives player-left after grace period');
 
-  // Verify the room is gone: new client tries to get it
   const c3 = makeClient();
   await waitFor(c3, 'connect');
-  c3.emit('get-room', room.id, uuidv4());
+  c3.emit('get-room', room.id, randomUUID());
   const result = await waitForAny(c3, ['room-state', 'error']);
   assert(result.event === 'error', 'Expired room returns error on get-room');
 
   c2.disconnect(); c3.disconnect();
 }
 
-// ─── Run all tests ─────────────────────────────────────────────────────────────
+// ─── Run all ───────────────────────────────────────────────────────────────────
 async function run() {
   console.log('\x1b[1m\x1b[36m══════════════════════════════════\x1b[0m');
   console.log('\x1b[1m\x1b[36m  Cup Pong Stress Test Suite\x1b[0m');
@@ -510,7 +456,9 @@ async function run() {
   try {
     await testRoomCreation();
     await testTwoPlayerGame();
-    await testThirdPlayerRejected();
+    await testThreePlayerRoom();
+    await testJoinRejectedAfterStart();
+    await testOnlyHostCanStart();
     await testTurnLogic();
     await testBonusTurn();
     await testWinCondition();
@@ -528,11 +476,8 @@ async function run() {
   const total = passed + failed;
   console.log('\n\x1b[1m──────────────────────────────────\x1b[0m');
   console.log(`\x1b[1mResults: ${passed}/${total} passed\x1b[0m`);
-  if (failed > 0) {
-    console.log(`\x1b[31m${failed} assertion(s) failed\x1b[0m`);
-  } else {
-    console.log('\x1b[32mAll tests passed!\x1b[0m');
-  }
+  if (failed > 0) console.log(`\x1b[31m${failed} assertion(s) failed\x1b[0m`);
+  else            console.log('\x1b[32mAll tests passed!\x1b[0m');
   console.log('');
   process.exit(failed > 0 ? 1 : 0);
 }

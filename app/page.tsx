@@ -3,7 +3,7 @@
 import { useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { getSocket, getPersistentId } from '@/lib/socket';
-import { GameRoom } from '@/types/game';
+import type { GameRoom } from '@/types/game';
 
 export default function HomePage() {
   const router = useRouter();
@@ -43,17 +43,17 @@ export default function HomePage() {
     const socket = getSocket();
     const pid = getPersistentId();
 
-    const onStarted = (room: GameRoom) => {
+    const onJoined = (room: GameRoom) => {
       socket.off('error', onError);
       router.push(`/game/${room.id}?name=${encodeURIComponent(playerName.trim())}`);
     };
     const onError = (msg: string) => {
-      socket.off('game-started', onStarted);
+      socket.off('room-joined', onJoined);
       setError(msg);
       setLoading(false);
     };
 
-    socket.once('game-started', onStarted);
+    socket.once('room-joined', onJoined);
     socket.once('error', onError);
     socket.emit('join-room', roomCode.trim().toUpperCase(), playerName.trim(), pid);
   };
@@ -146,11 +146,11 @@ export default function HomePage() {
         <div className="mt-6 bg-gray-50 border border-gray-200 rounded-xl p-4 text-sm text-gray-500">
           <p className="font-semibold text-gray-700 mb-2">How to Play</p>
           <ul className="space-y-1">
-            <li>Each player has <strong className="text-red-600">10 cups</strong> in a triangle</li>
+            <li>All players share <strong className="text-red-600">one cup pool</strong> — it grows with more players</li>
             <li>Take turns throwing <strong className="text-red-600">2 balls</strong> per round</li>
-            <li>Time the shot meter to aim accurately</li>
+            <li><strong className="text-red-600">Drag toward a cup</strong> to aim, release to throw</li>
             <li>Sink both balls to earn a <strong className="text-red-600">bonus turn</strong></li>
-            <li>Remove all opponent&apos;s cups to win</li>
+            <li>When the pool is empty, the player with the <strong className="text-red-600">most cups sunk</strong> wins</li>
           </ul>
         </div>
       </div>
