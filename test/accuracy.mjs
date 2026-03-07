@@ -5,9 +5,9 @@
  */
 
 // ── Mirror ThrowMechanic constants ─────────────────────────────────────────────
-const BASE_CUP_W   = 40;
-const BASE_CUP_H   = 48;
-const BASE_CUP_GAP = 7;
+const BASE_CUP_W   = 46;
+const BASE_CUP_H   = 55;
+const BASE_CUP_GAP = 13;
 const FAR_SCALE    = 0.62;
 const CUP_AREA_PAD = 18;
 

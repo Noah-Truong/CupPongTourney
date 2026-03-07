@@ -4,9 +4,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Cup } from '@/types/game';
 
 // ─── Layout constants ─────────────────────────────────────────────────────────
-const BASE_CUP_W   = 40;   // px at closest row (scale = 1.0)
-const BASE_CUP_H   = 48;   // px
-const BASE_CUP_GAP = 7;    // px
+const BASE_CUP_W   = 46;   // px at closest row (scale = 1.0)
+const BASE_CUP_H   = 55;   // px
+const BASE_CUP_GAP = 13;   // px
 const FAR_SCALE    = 0.62; // scale at farthest row (row 0)
 const CUP_AREA_PAD = 18;   // px from top of component
 const THROW_ZONE_H = 170;  // px
