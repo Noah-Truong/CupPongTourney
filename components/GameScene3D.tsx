@@ -97,7 +97,15 @@ function CupMesh({ pos, sinking }: { pos: THREE.Vector3; sinking: boolean }) {
   const side     = useRef(Math.random() > 0.5 ? 1 : -1);
 
   useFrame((_, dt) => {
-    if (!sinking || !groupRef.current) return;
+    if (!groupRef.current) return;
+    if (!sinking) {
+      // Cup is active (or rematch reset) — restore transform and reset timer
+      groupRef.current.position.copy(pos);
+      groupRef.current.rotation.set(0, 0, 0);
+      groupRef.current.scale.setScalar(1);
+      flyT.current = 0;
+      return;
+    }
     flyT.current = Math.min(flyT.current + dt / 0.55, 1);
     const t = flyT.current;
     const s = side.current;
