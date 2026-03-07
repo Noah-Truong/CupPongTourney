@@ -6,12 +6,12 @@ const { v4: uuidv4 } = require('uuid');
 
 const dev = process.env.NODE_ENV !== 'production';
 const port = parseInt(process.env.PORT || '3000', 10);
-// Always bind to 0.0.0.0 — never use process.env.HOSTNAME which on Linux containers
-// is set to the container's internal hex hostname (not a valid bind address).
+// Always bind to all interfaces — required for Railway and any containerised host.
+// Never pass hostname/port to next() when using a custom HTTP server; those options
+// only apply when Next.js manages its own server and cause request filtering otherwise.
 const BIND_ADDRESS = '0.0.0.0';
 
-// Next.js uses 'hostname' internally for URL construction — keep it as localhost.
-const app = next({ dev, hostname: 'localhost', port });
+const app = next({ dev });
 const handle = app.getRequestHandler();
 
 // roomId → room
@@ -263,4 +263,7 @@ app.prepare().then(() => {
   httpServer.listen(port, BIND_ADDRESS, () => {
     console.log(`> Ready on http://localhost:${port}`);
   });
+}).catch((err) => {
+  console.error('Server startup failed:', err);
+  process.exit(1);
 });
