@@ -156,10 +156,31 @@ export default function ThrowMechanic({
       const perp = Math.abs(vx * dir.y - vy * dir.x);
       if (perp < bestPerp) { bestPerp = perp; best = cup; }
     }
-    // Cup width at that row gives the effective "hit zone" radius
-    const sc = rowScale(best.row);
-    const hitZone = BASE_CUP_W * sc * 2.5;
-    const accuracy = Math.max(0, 1 - bestPerp / hitZone);
+    // Tiered accuracy zones — player must aim through the rim opening.
+    // rimR  = rim opening radius (~30% of cup width)
+    // bodyR = cup body edge       (~52% of cup width)
+    // nearR = near-miss boundary  (~80% of cup width)
+    const sc    = rowScale(best.row);
+    const cw    = BASE_CUP_W * sc;
+    const rimR  = cw * 0.30;
+    const bodyR = cw * 0.52;
+    const nearR = cw * 0.80;
+
+    let accuracy: number;
+    if (bestPerp <= rimR) {
+      // Clean shot through the opening: 82–100%
+      accuracy = 0.82 + (1 - bestPerp / rimR) * 0.18;
+    } else if (bestPerp <= bodyR) {
+      // Glancing the rim: 20–82%, steep quadratic drop
+      const t = (bestPerp - rimR) / (bodyR - rimR);
+      accuracy = 0.82 - Math.pow(t, 0.65) * 0.62;
+    } else if (bestPerp <= nearR) {
+      // Near miss: 1–20%
+      const t = (bestPerp - bodyR) / (nearR - bodyR);
+      accuracy = 0.20 - t * 0.19;
+    } else {
+      accuracy = 0;
+    }
     return { cup: best, accuracy };
   }, [cups, getCupCenter, ballX, ballY, rowScale]);
 
@@ -225,9 +246,9 @@ export default function ThrowMechanic({
     const aim = computeAim(dx, dy);
     if (!aim) return;
 
-    // Power accuracy: slow swipe penalizes accuracy
+    // Power accuracy: slow swipe penalizes accuracy (direction matters more)
     const powerAcc   = Math.min(1, Math.max(0.05, (vel - MIN_VEL) / 0.55));
-    const finalAcc   = aim.accuracy * 0.78 + powerAcc * 0.22;
+    const finalAcc   = aim.accuracy * 0.85 + powerAcc * 0.15;
 
     // Fast swipe = snappier ball flight
     const animDur    = Math.max(460, Math.min(830, 620 / Math.max(vel, 0.22)));
