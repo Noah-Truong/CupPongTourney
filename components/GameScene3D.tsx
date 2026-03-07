@@ -34,8 +34,9 @@ const CAM_POS     = [0, 2.5, 5.8] as const;
 const CAM_TARGET  = [0, 0.15, -1.0] as const;
 const CAM_FOV     = 58;
 
-const MIN_SWIPE   = 45;     // px — deliberate swipe required
-const MIN_VEL     = 0.08;   // px/ms
+const MIN_SWIPE   = 80;     // px  — requires a committed throw gesture
+const MIN_VEL     = 0.18;   // px/ms — slow drags rejected (ball has weight)
+const MAX_VEL     = 1.60;   // px/ms — full-power throw velocity
 
 // ── Props ─────────────────────────────────────────────────────────────────────
 interface Props {
@@ -121,7 +122,13 @@ function easeInOut(t: number) {
 
 // ── Scene handle ──────────────────────────────────────────────────────────────
 interface SceneHandle {
-  startFlight: (cupId: number, targetPos: THREE.Vector3) => void;
+  /** landingPos: raw 3D point (power-scaled). flightDuration/arcHeight driven by swipe speed. */
+  startFlight: (
+    cupId: number,
+    landingPos: THREE.Vector3,
+    flightDuration?: number,
+    arcHeight?: number,
+  ) => void;
   notifyResult: (hit: boolean, cupId: number) => void;
 }
 
@@ -198,12 +205,14 @@ type BallPhase = 'idle' | 'flying' | 'entering' | 'result';
 interface BallState {
   phase: BallPhase;
   elapsed: number;
-  /** Raw 3D landing point from the swipe ray (where ball ends its arc). */
+  /** Raw 3D landing point (power-scaled, where ball arc terminates). */
   targetPos: THREE.Vector3;
-  /** Cup center XZ, used during entering phase so ball descends into the cup. */
+  /** Cup center XZ — ball converges here during the 'entering' descent. */
   cupCenterPos: THREE.Vector3;
   targetCupId: number;
   isHit: boolean;
+  flightDuration: number;   // seconds — shorter for fast throws, longer for weak
+  arcHeight: number;        // world units — low flat arc for weak, high arc for strong
 }
 
 const BallRenderer = forwardRef<
@@ -216,6 +225,7 @@ const BallRenderer = forwardRef<
     phase: 'idle', elapsed: 0,
     targetPos: BALL_START.clone(), cupCenterPos: BALL_START.clone(),
     targetCupId: -1, isHit: false,
+    flightDuration: FLIGHT_S, arcHeight: ARC_HEIGHT,
   });
   const resultRef   = useRef<{ hit: boolean; cupId: number } | null>(null);
   const onLandedRef = useRef(onLanded);
@@ -228,30 +238,45 @@ const BallRenderer = forwardRef<
 
   useEffect(() => { onLandedRef.current = onLanded; }, [onLanded]);
 
-  // ── Reset sinkSet when a rematch resets all cups ────────────────────────
+  // ── Sync sinkSet with server state ──────────────────────────────────────
   const prevRemovedCountRef = useRef(0);
   useEffect(() => {
     const removedCount = cups.filter(c => c.removed).length;
+
+    // Rematch: server reset all cups → clear local animation state
     if (removedCount === 0 && prevRemovedCountRef.current > 0) {
       setSinkSet(new Set());
       stateRef.current.phase = 'idle';
+      prevRemovedCountRef.current = 0;
+      return;
     }
     prevRemovedCountRef.current = removedCount;
+
+    // Safety reconcile: if the ball timed-out and we missed adding a cup to
+    // sinkSet, catch it here once the phase is idle so the cup still flies away.
+    if (stateRef.current.phase === 'idle') {
+      setSinkSet(prev => {
+        const next = new Set(prev);
+        let changed = false;
+        cups.forEach(c => { if (c.removed && !prev.has(c.id)) { next.add(c.id); changed = true; } });
+        return changed ? next : prev;
+      });
+    }
   }, [cups]);
 
   useImperativeHandle(ref, () => ({
-    startFlight(cupId, landingPos) {
+    startFlight(cupId, landingPos, flightDuration = FLIGHT_S, arcHeight = ARC_HEIGHT) {
       if (stateRef.current.phase === 'flying' || stateRef.current.phase === 'entering') return;
       const numRows   = numRowsFromCups(cups);
       const cup       = cups.find(c => c.id === cupId);
       const center3d  = cup ? cupWorldPos(cup, numRows) : landingPos.clone();
-      // cupCenterPos: where ball descends into on a hit
       const cupCenter = new THREE.Vector3(center3d.x, CUP_RIM_Y + BALL_R * 0.15, center3d.z);
-      // targetPos: where the ball arc actually lands (raw swipe direction)
       const rawLand   = new THREE.Vector3(landingPos.x, CUP_RIM_Y + BALL_R * 0.15, landingPos.z);
       stateRef.current = {
         phase: 'flying', elapsed: 0,
-        targetPos: rawLand, cupCenterPos: cupCenter, targetCupId: cupId, isHit: false,
+        targetPos: rawLand, cupCenterPos: cupCenter,
+        targetCupId: cupId, isHit: false,
+        flightDuration, arcHeight,
       };
       resultRef.current = null;
       if (ballRef.current) ballRef.current.position.copy(BALL_START);
@@ -275,18 +300,18 @@ const BallRenderer = forwardRef<
 
     // ── Phase 1: arc flight to cup rim ──────────────────────────────────────
     if (s.phase === 'flying') {
-      const raw  = Math.min(s.elapsed / FLIGHT_S, 1);
+      const raw  = Math.min(s.elapsed / s.flightDuration, 1);
       const ease = easeInOut(raw);
       const x    = lerp(BALL_START.x, s.targetPos.x, ease);
       const z    = lerp(BALL_START.z, s.targetPos.z, ease);
       const arcY = BALL_START.y
-        + ARC_HEIGHT * 4 * raw * (1 - raw)
+        + s.arcHeight * 4 * raw * (1 - raw)
         + (s.targetPos.y - BALL_START.y) * ease;
 
       if (ballRef.current) ballRef.current.position.set(x, arcY, z);
 
-      const height  = arcY - TABLE_Y;
-      const shadowSc = Math.max(0.05, 1 - height / (ARC_HEIGHT * 1.5));
+      const height   = arcY - TABLE_Y;
+      const shadowSc = Math.max(0.05, 1 - height / (s.arcHeight * 1.5));
       if (shadowRef.current) {
         shadowRef.current.position.set(x, TABLE_Y + 0.001, z);
         shadowRef.current.scale.setScalar(shadowSc);
@@ -295,7 +320,7 @@ const BallRenderer = forwardRef<
 
       if (raw >= 1) {
         const result   = resultRef.current;
-        const timedOut = s.elapsed > FLIGHT_S + 0.20;
+        const timedOut = s.elapsed > s.flightDuration + 0.50;
         if (result !== null || timedOut) {
           const hit   = result?.hit ?? false;
           const cupId = result?.cupId ?? s.targetCupId;
@@ -493,46 +518,62 @@ export default function GameScene3D({ cups, isMyTurn, onThrow, lastThrow }: Prop
     return cam;
   }, [size.w, size.h]);
 
-  // ── Aim computation: pure ray cast — zero aim assist ────────────────────────
-  // 1. Convert swipe direction to a 3D ray via camera unprojection.
-  // 2. Intersect the ray with y = CUP_RIM_Y (the cup opening plane).
-  // 3. Accuracy = purely geometric: how close the landing is to a cup center.
-  //    No snapping, no zone bias — if you aim inside the cup, you make it.
-  const computeAim = useCallback((dx: number, dy: number) => {
+  // ── Aim + throw-power computation ───────────────────────────────────────────
+  // - Swipe direction: ray-cast onto cup-rim plane → raw 3D landing point.
+  // - Throw power: derived from swipe velocity. Weak throws physically fall short
+  //   (effective landing scaled toward ball start), so far cups need real effort.
+  // - Arc / flight speed: fast swipe = high arc + quick flight; slow = flat + slow.
+  // - No aim assist: accuracy is purely how close the landing lands to a cup.
+  const computeAim = useCallback((dx: number, dy: number, vel: number) => {
     const d = Math.hypot(dx, dy);
     if (d < MIN_SWIPE) return null;
+
+    // Only accept upward throws: the upward component must be at least 50% of
+    // the horizontal component. Prevents sideways flicks from registering.
+    if (dy > -Math.abs(dx) * 0.5) return null;
+
     const dir   = { x: dx / d, y: dy / d };
     const avail = cups.filter(c => !c.removed);
     if (!avail.length) return null;
     const numRows = numRowsFromCups(cups);
     const { w, h } = size;
 
-    // Project ball's 2D screen position, use it as the swipe origin
-    const b2d = project2D(BALL_START, projCam, w, h);
+    const b2d    = project2D(BALL_START, projCam, w, h);
+    const rawLnd = swipeRayToPlane(dir, b2d, projCam, w, h, CUP_RIM_Y);
+    if (!rawLnd) return null;
 
-    // Cast the swipe ray onto the cup-rim plane to get a raw 3D landing point
-    const landing = swipeRayToPlane(dir, b2d, projCam, w, h, CUP_RIM_Y);
-    if (!landing) return null;
+    // Throw power in [0, 1] from velocity. Curve is sub-linear so the mid-range
+    // feels meaningful — a moderate swipe gives ~0.55 power, max needs full speed.
+    const throwPower = Math.min(1, Math.max(0,
+      Math.pow((vel - MIN_VEL) / (MAX_VEL - MIN_VEL), 0.70),
+    ));
 
-    // Find the nearest available cup to the landing point (in XZ)
-    let best     = avail[0];
-    let bestDist = Infinity;
+    // Scale effective landing by power. Power < ~0.88 means the ball falls short.
+    // Players must swing hard to reach the far cups.
+    const powerFactor = Math.min(1, throwPower / 0.88);
+    const effX = lerp(BALL_START.x, rawLnd.x, powerFactor);
+    const effZ = lerp(BALL_START.z, rawLnd.z, powerFactor);
+
+    // Nearest cup to the power-adjusted landing
+    let best = avail[0], bestDist = Infinity;
     for (const cup of avail) {
       const cp   = cupWorldPos(cup, numRows);
-      const dist = Math.hypot(landing.x - cp.x, landing.z - cp.z);
+      const dist = Math.hypot(effX - cp.x, effZ - cp.z);
       if (dist < bestDist) { bestDist = dist; best = cup; }
     }
 
-    // Accuracy: linear in how close the landing is to the cup's rim opening.
-    // bestDist = 0 → dead center → accuracy 1.0
-    // bestDist = CUP_TOP_R → at rim edge → accuracy 0
-    // No zones, no artificial floors — the player's raw aim determines everything.
+    // Geometric accuracy — dead center = 1.0, rim edge = 0, outside = 0
     const accuracy = Math.max(0, 1 - bestDist / CUP_TOP_R);
 
-    // Landing position carries the raw XZ (ball flies here, not to cup center)
-    const landingPos = new THREE.Vector3(landing.x, CUP_RIM_Y, landing.z);
+    // Physics driven by power: weak = flat slow arc, strong = high fast arc
+    const flightDuration = lerp(1.40, 0.60, throwPower);
+    const arcHeight      = lerp(0.85, 2.70, throwPower);
 
-    return { cup: best, accuracy, targetPos: landingPos };
+    return {
+      cup: best, accuracy,
+      targetPos: new THREE.Vector3(effX, CUP_RIM_Y, effZ),
+      flightDuration, arcHeight,
+    };
   }, [cups, projCam, size]);
 
   // ── Spectator ball animation ─────────────────────────────────────────────
@@ -569,23 +610,18 @@ export default function GameScene3D({ cups, isMyTurn, onThrow, lastThrow }: Prop
     const dx  = e.clientX - sx;
     const dy  = e.clientY - sy;
     const dt  = Math.max(1, performance.now() - st);
-
-    // Minimum velocity gate: prevents accidental slow drags registering as throws
     const vel = Math.hypot(dx, dy) / dt;
     if (vel < MIN_VEL) return;
 
-    const aim = computeAim(dx, dy);
+    const aim = computeAim(dx, dy, vel);
     if (!aim) return;
-
-    // Accuracy is purely geometric — wherever the swipe ray lands relative to cups
-    const finalAcc = aim.accuracy;
 
     localThrowRef.current = true;
     setThrowing(true);
-    sceneRef.current?.startFlight(aim.cup.id, aim.targetPos);
-    onThrow(aim.cup.id, finalAcc);
+    sceneRef.current?.startFlight(aim.cup.id, aim.targetPos, aim.flightDuration, aim.arcHeight);
+    onThrow(aim.cup.id, aim.accuracy);
 
-    setTimeout(() => setThrowing(false), (FLIGHT_S + ENTER_S + BOUNCE_S + 0.5) * 1000);
+    setTimeout(() => setThrowing(false), (aim.flightDuration + ENTER_S + BOUNCE_S + 0.5) * 1000);
   }, [isMyTurn, throwing, computeAim, onThrow]);
 
   return (
