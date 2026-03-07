@@ -318,7 +318,6 @@ function GamePageInner({ params }: PageProps) {
       <ThrowMechanic
         cups={room.sharedCups}
         isMyTurn={isMyTurn}
-        ballsThrown={ballsThrown}
         onThrow={handleThrow}
         lastResult={lastResult}
       />

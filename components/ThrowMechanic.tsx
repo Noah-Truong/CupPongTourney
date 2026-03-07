@@ -4,55 +4,49 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Cup } from '@/types/game';
 
 // ─── Layout constants ─────────────────────────────────────────────────────────
-const CUP_GAP        = 6;
-const THROW_ZONE_H   = 170;
-const BALL_SIZE      = 38;
-const MAX_CUP_SIZE   = 40;
-const MIN_CUP_SIZE   = 26;
+const BASE_CUP_W   = 40;   // px at closest row (scale = 1.0)
+const BASE_CUP_H   = 48;   // px
+const BASE_CUP_GAP = 7;    // px
+const FAR_SCALE    = 0.62; // scale at farthest row (row 0)
+const CUP_AREA_PAD = 18;   // px from top of component
+const THROW_ZONE_H = 170;  // px
+const BALL_D       = 40;   // ball diameter at rest
 
-// ─── Geometry helpers ─────────────────────────────────────────────────────────
-function normalize(v: { x: number; y: number }) {
-  const len = Math.hypot(v.x, v.y);
-  return len < 1e-6 ? { x: 0, y: -1 } : { x: v.x / len, y: v.y / len };
+const MIN_SWIPE_DIST = 16; // px — ignore tiny taps
+const MIN_VEL        = 0.10; // px/ms — below = "too slow" penalty
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+interface CupLayout { x: number; y: number; w: number; h: number }
+
+interface FlightState {
+  x: number; y: number;
+  scale: number; opacity: number;
+  shadowX: number; shadowOpacity: number;
 }
 
-// Perpendicular distance from point p to ray (origin o, direction d)
-function rayPointDist(
-  o: { x: number; y: number },
-  d: { x: number; y: number },
-  p: { x: number; y: number }
-) {
-  const t = (p.x - o.x) * d.x + (p.y - o.y) * d.y;
-  if (t < 0) return Math.hypot(p.x - o.x, p.y - o.y);
-  return Math.hypot(p.x - (o.x + t * d.x), p.y - (o.y + t * d.y));
-}
-
-// ─── Props ────────────────────────────────────────────────────────────────────
 interface Props {
   cups: Cup[];
   isMyTurn: boolean;
-  ballsThrown: number;    // 0 or 1
   onThrow: (cupId: number, accuracy: number) => void;
   lastResult?: 'hit' | 'miss' | null;
 }
 
-interface DragState {
-  cx: number; // current pointer x in container coords
-  cy: number; // current pointer y
-}
-
-interface AimResult {
-  cupId: number;
-  accuracy: number; // 0–1
-}
-
-export default function ThrowMechanic({ cups, isMyTurn, ballsThrown, onThrow, lastResult }: Props) {
+// ─── Main component ───────────────────────────────────────────────────────────
+export default function ThrowMechanic({
+  cups, isMyTurn, onThrow, lastResult,
+}: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
-  const [size, setSize] = useState({ w: 360, h: 520 });
-  const [drag, setDrag] = useState<DragState | null>(null);
+  const [size, setSize]       = useState({ w: 360, h: 540 });
+  const sweepRef              = useRef<{ x: number; y: number; t: number } | null>(null);
+  const [flight, setFlight]   = useState<FlightState | null>(null);
   const [throwing, setThrowing] = useState(false);
+  const [sunkCups, setSunkCups] = useState<Set<number>>(new Set());
+  const [resultKey, setResultKey] = useState(0); // force re-mount for repeated results
+  const [showResult, setShowResult] = useState<'hit' | 'miss' | null>(null);
+  const rafRef       = useRef<number>(0);
+  const prevCupsRef  = useRef<Cup[]>(cups);
 
-  // Track container size
+  // Resize observer
   useEffect(() => {
     if (!containerRef.current) return;
     const ro = new ResizeObserver(([e]) => {
@@ -62,263 +56,474 @@ export default function ThrowMechanic({ cups, isMyTurn, ballsThrown, onThrow, la
     return () => ro.disconnect();
   }, []);
 
-  // ── Cup layout math ────────────────────────────────────────────────────────
-  // The cup triangle has `numRows` rows (row 0 is widest with numRows cups).
+  // Detect newly-sunk cups → trigger fly-away animation
+  useEffect(() => {
+    const fresh = cups.filter(
+      c => c.removed && !prevCupsRef.current.find(p => p.id === c.id)?.removed
+    );
+    if (fresh.length > 0) {
+      setSunkCups(prev => new Set([...prev, ...fresh.map(c => c.id)]));
+      const ids = fresh.map(c => c.id);
+      setTimeout(() => {
+        setSunkCups(prev => { const n = new Set(prev); ids.forEach(id => n.delete(id)); return n; });
+      }, 950);
+    }
+    prevCupsRef.current = cups;
+  }, [cups]);
+
+  // Show result text flash on each throw
+  useEffect(() => {
+    if (!lastResult) return;
+    setShowResult(lastResult);
+    setResultKey(k => k + 1);
+    const t = setTimeout(() => setShowResult(null), 1600);
+    return () => clearTimeout(t);
+  }, [lastResult]);
+
+  // Clean up RAF on unmount
+  useEffect(() => () => { if (rafRef.current) cancelAnimationFrame(rafRef.current); }, []);
+
+  // ── Cup layout: manual perspective (far rows smaller, close rows larger) ────
   const numRows = useMemo(
-    () => (cups.length > 0 ? Math.max(...cups.map(c => c.row)) + 1 : 4),
+    () => cups.length > 0 ? Math.max(...cups.map(c => c.row)) + 1 : 4,
     [cups]
   );
 
-  // Cup size: fill width for the widest row, clamped to [MIN, MAX]
-  const cupSize = useMemo(() => {
-    const availW = size.w * 0.90;
-    const byWidth = Math.floor(availW / numRows) - CUP_GAP;
-    // Also constrain by available height above the throw zone
-    const availH = size.h - THROW_ZONE_H - 24; // top padding
-    const byHeight = Math.floor(availH / numRows) - CUP_GAP;
-    return Math.min(MAX_CUP_SIZE, Math.max(MIN_CUP_SIZE, Math.min(byWidth, byHeight)));
-  }, [size.w, size.h, numRows]);
+  /**
+   * rowScale(r): r=0 (top, farthest) → FAR_SCALE, r=numRows-1 (bottom, closest) → 1.0
+   * Linear interpolation gives a nice "table receding" perspective look.
+   */
+  const rowScale = useCallback(
+    (row: number) => FAR_SCALE + (1 - FAR_SCALE) * (row / Math.max(1, numRows - 1)),
+    [numRows]
+  );
 
-  // Ball position (center of throw zone)
+  /**
+   * Compute layout for every cup. Returns a Map<cupId → {x,y,w,h}>.
+   * The widest row (row 0, farthest) is at the top with small cups;
+   * the single-cup row (row numRows-1, closest) is at the bottom with big cups.
+   */
+  const cupLayout = useMemo((): Map<number, CupLayout> => {
+    const map = new Map<number, CupLayout>();
+    let y = CUP_AREA_PAD;
+    for (let row = 0; row < numRows; row++) {
+      const sc   = rowScale(row);
+      const cw   = BASE_CUP_W * sc;
+      const ch   = BASE_CUP_H * sc;
+      const gap  = BASE_CUP_GAP * sc;
+      const cupsInRow = numRows - row;
+      const totalW = cupsInRow * cw + (cupsInRow - 1) * gap;
+      const startX = (size.w - totalW) / 2;
+      cups.filter(c => c.row === row).forEach(cup => {
+        map.set(cup.id, {
+          x: startX + cup.col * (cw + gap),
+          y,
+          w: cw,
+          h: ch,
+        });
+      });
+      y += ch + gap;
+    }
+    return map;
+  }, [cups, numRows, rowScale, size.w]);
+
+  const getCupCenter = useCallback((cup: Cup) => {
+    const l = cupLayout.get(cup.id);
+    return l ? { x: l.x + l.w / 2, y: l.y + l.h / 2 } : { x: size.w / 2, y: 0 };
+  }, [cupLayout, size.w]);
+
+  // Ball home position (center of throw zone)
   const ballX = size.w / 2;
   const ballY = size.h - THROW_ZONE_H / 2;
+  // Y-coordinate of table "edge" divider
+  const tableEdgeY = size.h - THROW_ZONE_H;
 
-  // Cup center in container coordinates
-  const getCupCenter = useCallback(
-    (cup: Cup) => {
-      const cupsInRow = numRows - cup.row; // row 0 has numRows cups
-      const totalW = cupsInRow * cupSize + (cupsInRow - 1) * CUP_GAP;
-      const startX = (size.w - totalW) / 2;
-      return {
-        x: startX + cup.col * (cupSize + CUP_GAP) + cupSize / 2,
-        y: 20 + cup.row * (cupSize + CUP_GAP) + cupSize / 2,
-      };
-    },
-    [size.w, numRows, cupSize]
-  );
+  // ── Aim: swipe vector → nearest cup by perpendicular ray distance ────────
+  const computeAim = useCallback((dx: number, dy: number) => {
+    const dist = Math.hypot(dx, dy);
+    if (dist < 1) return null;
+    const dir = { x: dx / dist, y: dy / dist };
+    const available = cups.filter(c => !c.removed);
+    if (available.length === 0) return null;
 
-  // ── Aim calculation ────────────────────────────────────────────────────────
-  // The throw vector is from the ball toward the current drag position.
-  // We cast a ray from ball in that direction and find the nearest cup.
-  const computeAim = useCallback(
-    (cx: number, cy: number): AimResult | null => {
-      const dx = cx - ballX;
-      const dy = cy - ballY;
-      if (Math.hypot(dx, dy) < 10) return null;
+    let best = available[0];
+    let bestPerp = Infinity;
+    for (const cup of available) {
+      const { x: cx, y: cy } = getCupCenter(cup);
+      const vx = cx - ballX, vy = cy - ballY;
+      const t = vx * dir.x + vy * dir.y;
+      if (t <= 0) continue; // behind the swipe direction
+      const perp = Math.abs(vx * dir.y - vy * dir.x);
+      if (perp < bestPerp) { bestPerp = perp; best = cup; }
+    }
+    // Cup width at that row gives the effective "hit zone" radius
+    const sc = rowScale(best.row);
+    const hitZone = BASE_CUP_W * sc * 2.5;
+    const accuracy = Math.max(0, 1 - bestPerp / hitZone);
+    return { cup: best, accuracy };
+  }, [cups, getCupCenter, ballX, ballY, rowScale]);
 
-      const dir = normalize({ x: dx, y: dy });
-      const available = cups.filter(c => !c.removed);
-      if (available.length === 0) return null;
+  // ── RAF ball arc animation ────────────────────────────────────────────────
+  const startFlight = useCallback((
+    toX: number, toY: number, dur: number, onDone: () => void
+  ) => {
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    const fromX = ballX, fromY = ballY;
+    const arcH  = Math.max(90, (fromY - toY) * 0.55 + 40);
+    const t0    = performance.now();
 
-      let best = available[0];
-      let bestDist = Infinity;
-      for (const cup of available) {
-        const center = getCupCenter(cup);
-        const dist = rayPointDist({ x: ballX, y: ballY }, dir, center);
-        if (dist < bestDist) { bestDist = dist; best = cup; }
-      }
+    function tick(now: number) {
+      const raw  = Math.min(1, (now - t0) / dur);
+      // ease: cubic in-out
+      const ease = raw < 0.5 ? 4 * raw * raw * raw : 1 - Math.pow(-2 * raw + 2, 3) / 2;
 
-      // accuracy: 1.0 if ray passes through cup center, 0 if >2.5 cup-widths away
-      const accuracy = Math.max(0, 1 - bestDist / (cupSize * 2.5));
-      return { cupId: best.id, accuracy };
-    },
-    [cups, ballX, ballY, getCupCenter, cupSize]
-  );
+      const x     = fromX + (toX - fromX) * ease;
+      const baseY = fromY + (toY - fromY) * ease;
+      const y     = baseY - arcH * Math.sin(Math.PI * raw); // parabolic arc
+      const scale = 1 - raw * 0.65;                         // shrinks as it recedes
+      const opacity = raw > 0.87 ? 1 - (raw - 0.87) / 0.13 * 0.45 : 1;
 
-  const aimResult = useMemo(
-    () => (drag ? computeAim(drag.cx, drag.cy) : null),
-    [drag, computeAim]
-  );
+      // Shadow follows ball's X but stays at table-edge level
+      const shadowX = fromX + (toX - fromX) * ease;
+      // Shadow fades in as ball approaches cups, out when near end
+      const shadowOpacity = Math.sin(Math.PI * raw) * 0.55;
 
-  // ── Pointer events ─────────────────────────────────────────────────────────
-  const handlePointerDown = useCallback(
-    (e: React.PointerEvent) => {
-      if (!isMyTurn || throwing || cups.filter(c => !c.removed).length === 0) return;
-      e.currentTarget.setPointerCapture(e.pointerId);
-      const rect = containerRef.current!.getBoundingClientRect();
-      setDrag({ cx: e.clientX - rect.left, cy: e.clientY - rect.top });
-    },
-    [isMyTurn, throwing, cups]
-  );
+      setFlight({ x, y, scale, opacity, shadowX, shadowOpacity });
 
-  const handlePointerMove = useCallback(
-    (e: React.PointerEvent) => {
-      if (!drag) return;
-      const rect = containerRef.current!.getBoundingClientRect();
-      setDrag({ cx: e.clientX - rect.left, cy: e.clientY - rect.top });
-    },
-    [drag]
-  );
+      if (raw < 1) rafRef.current = requestAnimationFrame(tick);
+      else { setFlight(null); onDone(); }
+    }
+    rafRef.current = requestAnimationFrame(tick);
+  }, [ballX, ballY]);
 
-  const handlePointerUp = useCallback(() => {
-    if (!drag) return;
-    const aim = computeAim(drag.cx, drag.cy);
-    setDrag(null);
-    if (!aim || aim.accuracy < 0.01) return;
+  // ── Swipe gesture (no visual guide) ──────────────────────────────────────
+  const handlePointerDown = useCallback((e: React.PointerEvent) => {
+    if (!isMyTurn || throwing || cups.filter(c => !c.removed).length === 0) return;
+    e.currentTarget.setPointerCapture(e.pointerId);
+    const rect = containerRef.current!.getBoundingClientRect();
+    sweepRef.current = {
+      x: e.clientX - rect.left,
+      y: e.clientY - rect.top,
+      t: e.timeStamp,
+    };
+  }, [isMyTurn, throwing, cups]);
+
+  const handlePointerUp = useCallback((e: React.PointerEvent) => {
+    const sw = sweepRef.current;
+    sweepRef.current = null;
+    if (!sw || !isMyTurn || throwing) return;
+
+    const rect = containerRef.current!.getBoundingClientRect();
+    const dx   = e.clientX - rect.left - sw.x;
+    const dy   = e.clientY - rect.top  - sw.y;
+    const dist = Math.hypot(dx, dy);
+    const dt   = Math.max(1, e.timeStamp - sw.t);
+    const vel  = dist / dt; // px/ms
+
+    if (dist < MIN_SWIPE_DIST) return;
+
+    const aim = computeAim(dx, dy);
+    if (!aim) return;
+
+    // Power accuracy: slow swipe penalizes accuracy
+    const powerAcc   = Math.min(1, Math.max(0.05, (vel - MIN_VEL) / 0.55));
+    const finalAcc   = aim.accuracy * 0.78 + powerAcc * 0.22;
+
+    // Fast swipe = snappier ball flight
+    const animDur    = Math.max(460, Math.min(830, 620 / Math.max(vel, 0.22)));
+
     setThrowing(true);
-    onThrow(aim.cupId, aim.accuracy);
-    setTimeout(() => setThrowing(false), 700);
-  }, [drag, computeAim, onThrow]);
+    const target = getCupCenter(aim.cup);
+    startFlight(target.x, target.y, animDur, () => setThrowing(false));
+    onThrow(aim.cup.id, finalAcc);
+  }, [isMyTurn, throwing, computeAim, getCupCenter, startFlight, onThrow]);
 
-  // ── SVG trajectory arc ─────────────────────────────────────────────────────
-  const svgArc = useMemo(() => {
-    if (!drag) return null;
-    const dx = drag.cx - ballX;
-    const dy = drag.cy - ballY;
-    if (Math.hypot(dx, dy) < 10) return null;
-    const dir = normalize({ x: dx, y: dy });
-    const projLen = Math.min(size.h * 1.5, Math.hypot(dx, dy) * 3.5);
-    const ex = ballX + dir.x * projLen;
-    const ey = ballY + dir.y * projLen;
-    // Control point: perpendicular offset for a gentle arc
-    const mx = (ballX + ex) / 2 - dir.y * 50;
-    const my = (ballY + ey) / 2 + dir.x * 50;
-    return { path: `M ${ballX} ${ballY} Q ${mx} ${my} ${ex} ${ey}`, ex, ey };
-  }, [drag, ballX, ballY, size.h]);
+  // ── Render a single 3D cup ────────────────────────────────────────────────
+  const renderCup = useCallback((cup: Cup) => {
+    const l = cupLayout.get(cup.id);
+    if (!l) return null;
 
-  // ── Aim label ──────────────────────────────────────────────────────────────
-  const aimLabel = aimResult
-    ? aimResult.accuracy > 0.75 ? 'Perfect aim!'
-    : aimResult.accuracy > 0.45 ? 'Good aim'
-    : aimResult.accuracy > 0.15 ? 'Rough aim'
-    : 'Aim at a cup'
-    : 'Drag toward a cup to aim';
+    const isSinking  = sunkCups.has(cup.id);
+    const flyRight   = (cup.col + cup.row) % 2 === 0;
+    const rimH       = l.h * 0.26;
+    const shineW     = l.w * 0.2;
+    const shineH     = l.h * 0.44;
 
-  const aimColor = aimResult
-    ? aimResult.accuracy > 0.75 ? 'text-green-600'
-    : aimResult.accuracy > 0.45 ? 'text-orange-500'
-    : 'text-red-400'
-    : 'text-gray-400';
+    return (
+      <div
+        key={cup.id}
+        style={{
+          position: 'absolute',
+          left: l.x,
+          top:  l.y,
+          width: l.w,
+          height: l.h,
+          animation: isSinking
+            ? `${flyRight ? 'cupFlyRight' : 'cupFlyLeft'} 0.88s cubic-bezier(0.2,0,0.8,1) forwards`
+            : undefined,
+        }}
+      >
+        {!cup.removed && (
+          <>
+            {/* Ground shadow */}
+            <div style={{
+              position: 'absolute',
+              bottom: -5,
+              left: '8%',
+              width: '84%',
+              height: l.h * 0.14,
+              background: 'rgba(0,0,0,0.28)',
+              borderRadius: '50%',
+              filter: `blur(${Math.max(2, l.w * 0.08)}px)`,
+              transform: 'scaleY(0.35)',
+            }} />
 
-  const ballNum = ballsThrown + 1; // 1 or 2
+            {/* Cup body — tapered trapezoid with cylindrical gradient */}
+            <div style={{
+              position: 'absolute',
+              bottom: 0,
+              left: 0,
+              width: '100%',
+              height: '87%',
+              background: `linear-gradient(
+                to right,
+                #6B0000 0%, #B71C1C 11%, #D32F2F 20%,
+                #F44336 32%, #FF7070 45%, #FF8585 50%, #FF7070 55%,
+                #F44336 68%, #D32F2F 80%, #B71C1C 89%, #6B0000 100%
+              )`,
+              clipPath: 'polygon(13% 0%, 87% 0%, 77% 100%, 23% 100%)',
+            }}>
+              {/* Subtle horizontal ridges */}
+              <div style={{
+                position: 'absolute',
+                inset: 0,
+                background: `repeating-linear-gradient(
+                  to bottom,
+                  transparent 0px,
+                  transparent 28%,
+                  rgba(0,0,0,0.06) 28%,
+                  rgba(0,0,0,0.06) 30%,
+                  transparent 30%,
+                  transparent 55%,
+                  rgba(0,0,0,0.06) 55%,
+                  rgba(0,0,0,0.06) 57%,
+                  transparent 57%,
+                  transparent 100%
+                )`,
+              }} />
+            </div>
 
-  // ── Render ─────────────────────────────────────────────────────────────────
+            {/* Rim — ellipse opening with interior depth */}
+            <div style={{
+              position: 'absolute',
+              top: 0,
+              left: '5%',
+              width: '90%',
+              height: rimH,
+              borderRadius: '50%',
+              background: 'radial-gradient(ellipse at 50% 38%, rgba(255,180,180,0.25) 0%, #C62828 52%, #7B0000 100%)',
+              border: `${Math.max(1, l.w * 0.035)}px solid rgba(255,140,140,0.55)`,
+              overflow: 'hidden',
+            }}>
+              {/* Interior dark cavity */}
+              <div style={{
+                position: 'absolute',
+                top: '30%',
+                left: '8%',
+                right: '8%',
+                bottom: 0,
+                background: 'rgba(0,0,0,0.5)',
+                borderRadius: '50%',
+              }} />
+            </div>
+
+            {/* Left-side shine / highlight */}
+            <div style={{
+              position: 'absolute',
+              top: rimH * 0.8,
+              left: '13%',
+              width: shineW,
+              height: shineH,
+              background: 'linear-gradient(155deg, rgba(255,255,255,0.38) 0%, rgba(255,255,255,0) 100%)',
+              borderRadius: '60% 60% 50% 50%',
+            }} />
+          </>
+        )}
+
+        {/* Faded outline for removed cups (empty slot) */}
+        {cup.removed && !isSinking && (
+          <div style={{
+            position: 'absolute',
+            bottom: 0,
+            left: 0,
+            width: '100%',
+            height: '87%',
+            background: 'rgba(220,220,220,0.1)',
+            clipPath: 'polygon(13% 0%, 87% 0%, 77% 100%, 23% 100%)',
+          }} />
+        )}
+      </div>
+    );
+  }, [cupLayout, sunkCups]);
+
+  // ── Render ────────────────────────────────────────────────────────────────
+  // Height of cup area (all rows stacked)
+  const cupAreaH = useMemo(() => {
+    let h = CUP_AREA_PAD;
+    for (let row = 0; row < numRows; row++) {
+      const sc = rowScale(row);
+      h += BASE_CUP_H * sc + BASE_CUP_GAP * sc;
+    }
+    return h;
+  }, [numRows, rowScale]);
+
   return (
     <div
       ref={containerRef}
-      className="relative flex-1 w-full overflow-hidden touch-none select-none"
+      className="relative flex-1 w-full touch-none select-none bg-white overflow-hidden"
       onPointerDown={handlePointerDown}
-      onPointerMove={handlePointerMove}
       onPointerUp={handlePointerUp}
-      onPointerCancel={() => setDrag(null)}
+      onPointerCancel={() => { sweepRef.current = null; }}
     >
-      {/* ── Cup pool ▽ ─────────────────────────────────────────────────── */}
-      <div className="flex flex-col items-center" style={{ paddingTop: 20 }}>
-        {Array.from({ length: numRows }, (_, row) => {
-          const rowCups = cups.filter(c => c.row === row).sort((a, b) => a.col - b.col);
-          const isTarget = (cup: Cup) => aimResult?.cupId === cup.id;
-          return (
-            <div key={row} className="flex" style={{ gap: CUP_GAP, marginBottom: CUP_GAP }}>
-              {rowCups.map(cup => (
-                <div
-                  key={cup.id}
-                  className={`
-                    rounded-full border-2 flex items-center justify-center
-                    transition-all duration-150
-                    ${cup.removed
-                      ? 'border-gray-200 bg-gray-50 opacity-20'
-                      : isTarget(cup)
-                        ? 'border-red-600 bg-red-500 shadow-lg shadow-red-200'
-                        : 'border-red-400 bg-red-50'
-                    }
-                  `}
-                  style={{
-                    width: cupSize,
-                    height: cupSize,
-                    transform: isTarget(cup) && !cup.removed ? 'scale(1.18)' : 'scale(1)',
-                  }}
-                >
-                  {!cup.removed && (
-                    <div
-                      className={`rounded-full ${isTarget(cup) ? 'bg-white' : 'bg-red-300'}`}
-                      style={{ width: cupSize * 0.28, height: cupSize * 0.28 }}
-                    />
-                  )}
-                </div>
-              ))}
-            </div>
-          );
-        })}
+      {/* ── Cup pool (absolutely positioned for correct hit-testing) ────── */}
+      <div style={{ position: 'absolute', inset: 0, bottom: THROW_ZONE_H }}>
+        {cups.map(renderCup)}
+
+        {/* Table edge shadow at bottom of cup area */}
+        <div style={{
+          position: 'absolute',
+          bottom: 0,
+          left: 0,
+          right: 0,
+          height: 18,
+          background: 'linear-gradient(to bottom, rgba(0,0,0,0.06) 0%, rgba(0,0,0,0.0) 100%)',
+        }} />
+        {/* Table-edge line */}
+        <div style={{
+          position: 'absolute',
+          bottom: 0,
+          left: '8%',
+          right: '8%',
+          height: 1,
+          background: 'rgba(0,0,0,0.08)',
+        }} />
       </div>
 
-      {/* ── SVG overlay: trajectory arc + target ring ──────────────────── */}
-      {svgArc && (
-        <svg
-          className="absolute inset-0 pointer-events-none"
-          width={size.w}
-          height={size.h}
-          style={{ overflow: 'visible' }}
-        >
-          <path
-            d={svgArc.path}
-            stroke="#ef4444"
-            strokeWidth="2.5"
-            strokeDasharray="10 6"
-            fill="none"
-            opacity="0.55"
-          />
-          {aimResult && (() => {
-            const center = getCupCenter(cups.find(c => c.id === aimResult.cupId)!);
-            return (
-              <circle
-                cx={center.x}
-                cy={center.y}
-                r={cupSize / 2 + 7}
-                stroke="#ef4444"
-                strokeWidth="2"
-                fill="none"
-                opacity="0.5"
-                strokeDasharray="5 3"
-              />
-            );
-          })()}
-        </svg>
+      {/* ── Flying ball + shadow ─────────────────────────────────────────── */}
+      {flight && (
+        <>
+          {/* Shadow projected on "table" near cup area */}
+          <div style={{
+            position: 'absolute',
+            left:  flight.shadowX - 13,
+            top:   tableEdgeY - 7,
+            width: 26,
+            height: 10,
+            background: 'rgba(0,0,0,0.25)',
+            borderRadius: '50%',
+            filter: 'blur(3px)',
+            opacity: flight.shadowOpacity,
+            pointerEvents: 'none',
+          }} />
+
+          {/* Ball sphere */}
+          <div style={{
+            position: 'absolute',
+            left:   flight.x - (BALL_D / 2) * flight.scale,
+            top:    flight.y - (BALL_D / 2) * flight.scale,
+            width:  BALL_D * flight.scale,
+            height: BALL_D * flight.scale,
+            borderRadius: '50%',
+            // Sphere shading: bright highlight top-left, dark bottom-right
+            background: 'radial-gradient(circle at 33% 28%, rgba(255,255,255,0.97) 0%, rgba(255,255,255,0.72) 17%, rgba(238,238,238,0.35) 38%, rgba(195,195,195,0.12) 65%, rgba(140,140,140,0.04) 85%)',
+            backgroundColor: '#ebebeb',
+            boxShadow: [
+              `${flight.scale * 5}px ${flight.scale * 6}px ${flight.scale * 16}px rgba(0,0,0,0.55)`,
+              `inset -${flight.scale * 3}px -${flight.scale * 3}px ${flight.scale * 8}px rgba(0,0,0,0.22)`,
+              `inset ${flight.scale * 2}px ${flight.scale * 2}px ${flight.scale * 5}px rgba(255,255,255,0.95)`,
+            ].join(', '),
+            opacity: flight.opacity,
+            pointerEvents: 'none',
+          }} />
+        </>
       )}
 
-      {/* ── Divider ────────────────────────────────────────────────────── */}
-      <div
-        className="absolute left-6 right-6 border-t border-dashed border-gray-200"
-        style={{ bottom: THROW_ZONE_H }}
-      />
-
       {/* ── Throw zone ─────────────────────────────────────────────────── */}
-      <div
-        className="absolute bottom-0 left-0 right-0 flex flex-col items-center justify-center gap-2"
-        style={{ height: THROW_ZONE_H }}
-      >
-        {isMyTurn ? (
-          <>
-            {/* Ball */}
-            <div
-              className={`
-                rounded-full border-4 bg-white shadow-md flex items-center justify-center
-                transition-all duration-200
-                ${drag ? 'border-red-600 shadow-red-300 shadow-lg' : 'border-red-400'}
-                ${throwing ? 'opacity-0 scale-0' : 'opacity-100 scale-100'}
-              `}
-              style={{ width: BALL_SIZE, height: BALL_SIZE }}
-            >
-              <div className="rounded-full bg-red-200" style={{ width: BALL_SIZE * 0.33, height: BALL_SIZE * 0.33 }} />
-            </div>
+      <div style={{
+        position: 'absolute',
+        bottom: 0,
+        left: 0,
+        right: 0,
+        height: THROW_ZONE_H,
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'center',
+        justifyContent: 'center',
+        gap: 10,
+      }}>
+        {isMyTurn && !throwing && (
+          /* The stationary ball — swipe anywhere to throw */
+          <div style={{ position: 'relative' }}>
+            {/* Ball ground shadow */}
+            <div style={{
+              position: 'absolute',
+              bottom: -6,
+              left: '12%',
+              width: '76%',
+              height: 10,
+              background: 'rgba(0,0,0,0.22)',
+              borderRadius: '50%',
+              filter: 'blur(4px)',
+            }} />
+            {/* 3D ball sphere */}
+            <div style={{
+              width: BALL_D,
+              height: BALL_D,
+              borderRadius: '50%',
+              background: 'radial-gradient(circle at 33% 28%, rgba(255,255,255,0.97) 0%, rgba(255,255,255,0.72) 17%, rgba(238,238,238,0.35) 38%, rgba(195,195,195,0.12) 65%, rgba(140,140,140,0.04) 85%)',
+              backgroundColor: '#ebebeb',
+              boxShadow: [
+                '4px 6px 16px rgba(0,0,0,0.55)',
+                'inset -3px -3px 8px rgba(0,0,0,0.22)',
+                'inset 2px 2px 5px rgba(255,255,255,0.95)',
+              ].join(', '),
+            }} />
+          </div>
+        )}
 
-            {/* Aim / instruction label */}
-            <p className={`text-xs font-medium transition-colors ${aimColor}`}>
-              {drag ? aimLabel : `Ball ${ballNum} of 2 — drag toward a cup to throw`}
-            </p>
-
-            {/* Last result (shown briefly when not dragging) */}
-            {!drag && lastResult && (
-              <p className={`text-sm font-semibold ${lastResult === 'hit' ? 'text-green-600' : 'text-gray-400'}`}>
-                {lastResult === 'hit' ? 'Sank it!' : 'Missed.'}
-              </p>
-            )}
-          </>
-        ) : (
-          <p className="text-sm text-gray-400 text-center px-4 leading-relaxed">
+        {!isMyTurn && (
+          <p style={{ color: '#9ca3af', fontSize: 13, textAlign: 'center' }}>
             Waiting for your turn…
           </p>
         )}
       </div>
+
+      {/* ── Result flash ─────────────────────────────────────────────────── */}
+      {showResult && (
+        <div
+          key={resultKey}
+          style={{
+            position: 'absolute',
+            top: '42%',
+            left: '50%',
+            transform: 'translateX(-50%)',
+            animation: 'resultPop 1.55s ease-out forwards',
+            pointerEvents: 'none',
+            zIndex: 20,
+          }}
+        >
+          <span style={{
+            display: 'block',
+            fontSize: showResult === 'hit' ? 30 : 20,
+            fontWeight: 900,
+            letterSpacing: '-0.5px',
+            color: showResult === 'hit' ? '#16a34a' : '#9ca3af',
+            textShadow: '0 2px 10px rgba(0,0,0,0.18)',
+          }}>
+            {showResult === 'hit' ? 'SANK IT' : 'miss'}
+          </span>
+        </div>
+      )}
     </div>
   );
 }
