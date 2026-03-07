@@ -1,65 +1,159 @@
-import Image from "next/image";
+'use client';
 
-export default function Home() {
+import { useState } from 'react';
+import { useRouter } from 'next/navigation';
+import { getSocket, getPersistentId } from '@/lib/socket';
+import { GameRoom } from '@/types/game';
+
+export default function HomePage() {
+  const router = useRouter();
+  const [playerName, setPlayerName] = useState('');
+  const [roomCode, setRoomCode] = useState('');
+  const [tab, setTab] = useState<'create' | 'join'>('create');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const handleCreate = () => {
+    if (!playerName.trim()) { setError('Enter your name first.'); return; }
+    setError('');
+    setLoading(true);
+    const socket = getSocket();
+    const pid = getPersistentId();
+
+    const onCreated = (room: GameRoom) => {
+      socket.off('error', onError);
+      router.push(`/game/${room.id}?name=${encodeURIComponent(playerName.trim())}`);
+    };
+    const onError = (msg: string) => {
+      socket.off('room-created', onCreated);
+      setError(msg);
+      setLoading(false);
+    };
+
+    socket.once('room-created', onCreated);
+    socket.once('error', onError);
+    socket.emit('create-room', playerName.trim(), pid);
+  };
+
+  const handleJoin = () => {
+    if (!playerName.trim()) { setError('Enter your name first.'); return; }
+    if (!roomCode.trim()) { setError('Enter the room code.'); return; }
+    setError('');
+    setLoading(true);
+    const socket = getSocket();
+    const pid = getPersistentId();
+
+    const onStarted = (room: GameRoom) => {
+      socket.off('error', onError);
+      router.push(`/game/${room.id}?name=${encodeURIComponent(playerName.trim())}`);
+    };
+    const onError = (msg: string) => {
+      socket.off('game-started', onStarted);
+      setError(msg);
+      setLoading(false);
+    };
+
+    socket.once('game-started', onStarted);
+    socket.once('error', onError);
+    socket.emit('join-room', roomCode.trim().toUpperCase(), playerName.trim(), pid);
+  };
+
   return (
-    <div className="flex min-h-screen items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex min-h-screen w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
+    <div className="min-h-screen flex flex-col items-center justify-center p-4 bg-white">
+      <div className="w-full max-w-md">
+        {/* Logo */}
+        <div className="text-center mb-8">
+          <h1 className="text-5xl font-black tracking-tight text-red-600">
+            CUP PONG
           </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
+          <p className="text-gray-500 mt-2">Real-time multiplayer — play with friends</p>
         </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
+
+        <div className="bg-white border border-gray-200 rounded-2xl p-6 shadow-sm">
+          {/* Name input */}
+          <div className="mb-5">
+            <label className="block text-sm font-semibold text-gray-700 mb-2">Your Name</label>
+            <input
+              type="text"
+              value={playerName}
+              onChange={e => setPlayerName(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && (tab === 'create' ? handleCreate() : handleJoin())}
+              placeholder="Enter your name..."
+              maxLength={20}
+              className="w-full bg-gray-50 border border-gray-300 text-gray-900 rounded-xl px-4 py-3 text-base outline-none focus:border-red-500 focus:ring-1 focus:ring-red-500/40 transition-all placeholder-gray-400"
             />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
+          </div>
+
+          {/* Tabs */}
+          <div className="flex rounded-xl overflow-hidden border border-gray-200 mb-5">
+            <button
+              onClick={() => { setTab('create'); setError(''); }}
+              className={`flex-1 py-2.5 text-sm font-bold transition-all ${tab === 'create' ? 'bg-red-600 text-white' : 'bg-gray-50 text-gray-500 hover:text-gray-900'}`}
+            >
+              Create Room
+            </button>
+            <button
+              onClick={() => { setTab('join'); setError(''); }}
+              className={`flex-1 py-2.5 text-sm font-bold transition-all ${tab === 'join' ? 'bg-red-600 text-white' : 'bg-gray-50 text-gray-500 hover:text-gray-900'}`}
+            >
+              Join Room
+            </button>
+          </div>
+
+          {tab === 'create' ? (
+            <div>
+              <p className="text-gray-500 text-sm mb-4">
+                Start a new game. You&apos;ll get a 6-character code to share with your opponent.
+              </p>
+              <button
+                onClick={handleCreate}
+                disabled={loading}
+                className="w-full py-3.5 bg-red-600 hover:bg-red-500 disabled:opacity-60 text-white font-black text-lg rounded-xl transition-all active:scale-[0.98]"
+              >
+                {loading ? 'Creating...' : 'Create Game'}
+              </button>
+            </div>
+          ) : (
+            <div>
+              <label className="block text-sm font-semibold text-gray-700 mb-2">Room Code</label>
+              <input
+                type="text"
+                value={roomCode}
+                onChange={e => setRoomCode(e.target.value.toUpperCase())}
+                onKeyDown={e => e.key === 'Enter' && handleJoin()}
+                placeholder="Enter 6-letter code..."
+                maxLength={6}
+                className="w-full bg-gray-50 border border-gray-300 text-gray-900 rounded-xl px-4 py-3 text-base outline-none focus:border-red-500 focus:ring-1 focus:ring-red-500/40 transition-all placeholder-gray-400 uppercase font-mono tracking-widest text-center mb-4"
+              />
+              <button
+                onClick={handleJoin}
+                disabled={loading}
+                className="w-full py-3.5 bg-blue-600 hover:bg-blue-500 disabled:opacity-60 text-white font-black text-lg rounded-xl transition-all active:scale-[0.98]"
+              >
+                {loading ? 'Joining...' : 'Join Game'}
+              </button>
+            </div>
+          )}
+
+          {error && (
+            <div className="mt-4 bg-red-50 border border-red-300 rounded-xl px-4 py-3 text-red-600 text-sm">
+              {error}
+            </div>
+          )}
         </div>
-      </main>
+
+        {/* Rules */}
+        <div className="mt-6 bg-gray-50 border border-gray-200 rounded-xl p-4 text-sm text-gray-500">
+          <p className="font-semibold text-gray-700 mb-2">How to Play</p>
+          <ul className="space-y-1">
+            <li>Each player has <strong className="text-red-600">10 cups</strong> in a triangle</li>
+            <li>Take turns throwing <strong className="text-red-600">2 balls</strong> per round</li>
+            <li>Time the shot meter to aim accurately</li>
+            <li>Sink both balls to earn a <strong className="text-red-600">bonus turn</strong></li>
+            <li>Remove all opponent&apos;s cups to win</li>
+          </ul>
+        </div>
+      </div>
     </div>
   );
 }
