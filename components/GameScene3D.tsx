@@ -219,7 +219,12 @@ const BallRenderer = forwardRef<
   });
   const resultRef   = useRef<{ hit: boolean; cupId: number } | null>(null);
   const onLandedRef = useRef(onLanded);
-  const [sinkSet, setSinkSet] = useState<Set<number>>(new Set());
+  // Pre-seed with cups already removed (reconnect / spectator join mid-game).
+  // During active play we ONLY add to sinkSet from the 'entering' phase so the
+  // cup never flies away before the ball physically lands inside it.
+  const [sinkSet, setSinkSet] = useState<Set<number>>(
+    () => new Set(cups.filter(c => c.removed).map(c => c.id)),
+  );
 
   useEffect(() => { onLandedRef.current = onLanded; }, [onLanded]);
 
@@ -372,7 +377,7 @@ const BallRenderer = forwardRef<
         <CupMesh
           key={cup.id}
           pos={cupWorldPos(cup, numRows)}
-          sinking={sinkSet.has(cup.id) || cup.removed}
+          sinking={sinkSet.has(cup.id)}
         />
       ))}
 
