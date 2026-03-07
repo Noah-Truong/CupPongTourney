@@ -1,8 +1,8 @@
 const { createServer } = require('http');
 const { parse } = require('url');
+const { randomUUID } = require('crypto');
 const next = require('next');
 const { Server } = require('socket.io');
-const { v4: uuidv4 } = require('uuid');
 
 const dev = process.env.NODE_ENV !== 'production';
 const port = parseInt(process.env.PORT || '3000', 10);
@@ -40,7 +40,7 @@ function calculateSuccess(meterValue) {
 }
 
 function createRoom(playerName, socketId, persistentId) {
-  const roomId = uuidv4().substring(0, 6).toUpperCase();
+  const roomId = randomUUID().substring(0, 6).toUpperCase();
   const player = {
     socketId,
     persistentId,
