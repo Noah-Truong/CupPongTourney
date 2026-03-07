@@ -8,34 +8,34 @@ import {
 } from 'react';
 import { Cup } from '@/types/game';
 
-// ── Scene geometry constants ──────────────────────────────────────────────────
-const TABLE_HW     = 2.0;
-const TABLE_DEPTH  = 11.0;
-const TABLE_THICK  = 0.10;
-const TABLE_Y      = 0;
+// ── Scene geometry ────────────────────────────────────────────────────────────
+const TABLE_HW    = 2.0;
+const TABLE_DEPTH = 11.0;
+const TABLE_THICK = 0.10;
+const TABLE_Y     = 0;
 
-const CUP_FAR_Z    = -3.4;
-const CUP_NEAR_Z   = -1.0;
-const CUP_SPACING  = 0.52;
-const CUP_H        = 0.46;
-const CUP_TOP_R    = 0.185;
-const CUP_BOT_R    = 0.115;
-const CUP_SEGS     = 24;
+const CUP_FAR_Z   = -3.4;
+const CUP_NEAR_Z  = -1.0;
+const CUP_SPACING = 0.52;
+const CUP_H       = 0.46;
+const CUP_TOP_R   = 0.185;
+const CUP_BOT_R   = 0.115;
+const CUP_SEGS    = 24;
+const CUP_RIM_Y   = TABLE_Y + CUP_H;   // absolute Y of the cup's rim opening
 
-const BALL_R       = 0.105;
-const BALL_START   = new THREE.Vector3(0, TABLE_Y + BALL_R + 0.01, 4.0);
-const ARC_HEIGHT   = 2.3;
-const FLIGHT_S     = 0.90;
-const BOUNCE_S     = 0.65;
+const BALL_R      = 0.105;
+const BALL_START  = new THREE.Vector3(0, TABLE_Y + BALL_R + 0.01, 4.0);
+const ARC_HEIGHT  = 2.3;
+const FLIGHT_S    = 0.90;   // ball flight to cup rim
+const ENTER_S     = 0.22;   // ball sinks into cup
+const BOUNCE_S    = 0.65;   // ball rolls away on miss
 
-const CAM_POS      = [0, 2.5, 5.8] as const;
-const CAM_TARGET   = [0, 0.15, -1.0] as const;
-const CAM_FOV      = 58;
+const CAM_POS     = [0, 2.5, 5.8] as const;
+const CAM_TARGET  = [0, 0.15, -1.0] as const;
+const CAM_FOV     = 58;
 
-// ── Swipe tuning ──────────────────────────────────────────────────────────────
-// Larger MIN_SWIPE = must make a deliberate gesture (reduces accidental throws)
-const MIN_SWIPE    = 45;   // px — increased from 18 for better control
-const MIN_VEL      = 0.08; // px/ms
+const MIN_SWIPE   = 45;     // px — deliberate swipe required
+const MIN_VEL     = 0.08;   // px/ms
 
 // ── Props ─────────────────────────────────────────────────────────────────────
 interface Props {
@@ -45,11 +45,12 @@ interface Props {
   lastThrow?: { cupId: number; hit: boolean } | null;
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── Geometry helpers ──────────────────────────────────────────────────────────
 function numRowsFromCups(cups: Cup[]) {
   return cups.length > 0 ? Math.max(...cups.map(c => c.row)) + 1 : 4;
 }
 
+/** Returns the cup's 3D center position (XZ are cup center, Y is mid-height). */
 function cupWorldPos(cup: Cup, numRows: number): THREE.Vector3 {
   const rowT = numRows <= 1 ? 0 : cup.row / (numRows - 1);
   const z    = CUP_FAR_Z + (CUP_NEAR_Z - CUP_FAR_Z) * rowT;
@@ -58,11 +59,24 @@ function cupWorldPos(cup: Cup, numRows: number): THREE.Vector3 {
   return new THREE.Vector3(x, TABLE_Y + CUP_H / 2, z);
 }
 
+/** Returns the position at the TOP OPENING of a cup (where ball enters). */
+function cupRimPos(cup: Cup, numRows: number): THREE.Vector3 {
+  const center = cupWorldPos(cup, numRows);
+  return new THREE.Vector3(center.x, CUP_RIM_Y + BALL_R * 0.2, center.z);
+}
+
 function project2D(
-  v: THREE.Vector3, camera: THREE.Camera, w: number, h: number,
+  v: THREE.Vector3, cam: THREE.Camera, w: number, h: number,
 ): { x: number; y: number } {
-  const s = v.clone().project(camera);
+  const s = v.clone().project(cam);
   return { x: (s.x + 1) / 2 * w, y: (-s.y + 1) / 2 * h };
+}
+
+/** Minimum angular difference between two angles (result in [0, π]). */
+function angleDiff(a: number, b: number): number {
+  let d = Math.abs(a - b) % (2 * Math.PI);
+  if (d > Math.PI) d = 2 * Math.PI - d;
+  return d;
 }
 
 function lerp(a: number, b: number, t: number) { return a + (b - a) * t; }
@@ -70,19 +84,16 @@ function easeInOut(t: number) {
   return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
 }
 
-// ── Scene handle exposed via forwardRef ───────────────────────────────────────
+// ── Scene handle ──────────────────────────────────────────────────────────────
 interface SceneHandle {
-  /** Begin ball flight to a cup. Safe to call while idle. */
   startFlight: (cupId: number, targetPos: THREE.Vector3) => void;
-  /** Queues the throw outcome — consumed when ball reaches cup. */
   notifyResult: (hit: boolean, cupId: number) => void;
 }
 
-// ── Cup mesh with fly-away animation ─────────────────────────────────────────
+// ── Hollow cup mesh with fly-away ─────────────────────────────────────────────
 function CupMesh({ pos, sinking }: { pos: THREE.Vector3; sinking: boolean }) {
   const groupRef = useRef<THREE.Group>(null!);
   const flyT     = useRef(0);
-  // Randomise fly direction once on mount
   const side     = useRef(Math.random() > 0.5 ? 1 : -1);
 
   useFrame((_, dt) => {
@@ -92,7 +103,7 @@ function CupMesh({ pos, sinking }: { pos: THREE.Vector3; sinking: boolean }) {
     const s = side.current;
     groupRef.current.position.set(
       pos.x + s * t * 1.5,
-      pos.y + Math.sin(t * Math.PI) * 1.0 - t * 0.3,
+      pos.y + Math.sin(t * Math.PI) * 1.1 - t * 0.3,
       pos.z + t * 0.6,
     );
     groupRef.current.rotation.z = s * t * Math.PI * 1.3;
@@ -101,30 +112,51 @@ function CupMesh({ pos, sinking }: { pos: THREE.Vector3; sinking: boolean }) {
 
   return (
     <group ref={groupRef} position={pos}>
-      {/* Main cone body */}
+      {/* ── Outer wall: open-top truncated cone ── */}
       <mesh castShadow>
-        <cylinderGeometry args={[CUP_TOP_R, CUP_BOT_R, CUP_H, CUP_SEGS]} />
-        <meshStandardMaterial color="#dc2626" roughness={0.42} metalness={0.08} />
+        {/* openEnded=true → no top/bottom caps → cup is hollow */}
+        <cylinderGeometry args={[CUP_TOP_R, CUP_BOT_R, CUP_H, CUP_SEGS, 1, true]} />
+        <meshStandardMaterial
+          color="#dc2626" roughness={0.40} metalness={0.08}
+          side={THREE.DoubleSide}   // shows red inner wall when looking in from top
+        />
       </mesh>
-      {/* ── Interior disc — white, recessed just inside the rim ── */}
-      <mesh position={[0, CUP_H / 2 - 0.01, 0]} rotation={[-Math.PI / 2, 0, 0]}>
-        <circleGeometry args={[CUP_TOP_R - 0.012, CUP_SEGS]} />
+
+      {/* ── Inner walls: slightly smaller cylinder, BackSide renders inward face ── */}
+      <mesh>
+        <cylinderGeometry args={[CUP_TOP_R - 0.010, CUP_BOT_R - 0.006, CUP_H - 0.015, CUP_SEGS, 1, true]} />
+        <meshStandardMaterial color="#8b0000" roughness={0.95} side={THREE.BackSide} />
+      </mesh>
+
+      {/* ── White base — visible when peering into the cup ── */}
+      <mesh position={[0, -CUP_H / 2 + 0.008, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+        <circleGeometry args={[CUP_BOT_R - 0.006, CUP_SEGS]} />
         <meshStandardMaterial color="#ffffff" roughness={0.6} />
       </mesh>
-      {/* Bottom cap */}
+
+      {/* ── Bottom exterior cap ── */}
       <mesh position={[0, -CUP_H / 2, 0]} rotation={[Math.PI / 2, 0, 0]}>
         <circleGeometry args={[CUP_BOT_R, CUP_SEGS]} />
         <meshStandardMaterial color="#b91c1c" roughness={0.5} />
+      </mesh>
+
+      {/* ── Rim lip: very thin flat ring at top opening ── */}
+      <mesh position={[0, CUP_H / 2, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+        <ringGeometry args={[CUP_TOP_R - 0.010, CUP_TOP_R + 0.004, CUP_SEGS]} />
+        <meshStandardMaterial color="#b91c1c" roughness={0.3} metalness={0.15} />
       </mesh>
     </group>
   );
 }
 
-// ── Ball + shadow + cups (inside Canvas) ─────────────────────────────────────
+// ── Ball + shadow ─────────────────────────────────────────────────────────────
+type BallPhase = 'idle' | 'flying' | 'entering' | 'result';
+
 interface BallState {
-  phase: 'idle' | 'flying' | 'result';
+  phase: BallPhase;
   elapsed: number;
-  targetPos: THREE.Vector3;
+  targetPos: THREE.Vector3;   // rim-top position (adjusted from cup center)
+  targetCupId: number;
   isHit: boolean;
 }
 
@@ -132,25 +164,37 @@ const BallRenderer = forwardRef<
   SceneHandle,
   { cups: Cup[]; onLanded: (hit: boolean) => void }
 >(({ cups, onLanded }, ref) => {
-  const ballRef   = useRef<THREE.Mesh>(null!);
-  const shadowRef = useRef<THREE.Mesh>(null!);
-  const stateRef  = useRef<BallState>({
+  const ballRef    = useRef<THREE.Mesh>(null!);
+  const shadowRef  = useRef<THREE.Mesh>(null!);
+  const stateRef   = useRef<BallState>({
     phase: 'idle', elapsed: 0,
-    targetPos: BALL_START.clone(), isHit: false,
+    targetPos: BALL_START.clone(), targetCupId: -1, isHit: false,
   });
-  const resultRef    = useRef<{ hit: boolean; cupId: number } | null>(null);
-  const onLandedRef  = useRef(onLanded);
+  const resultRef   = useRef<{ hit: boolean; cupId: number } | null>(null);
+  const onLandedRef = useRef(onLanded);
   const [sinkSet, setSinkSet] = useState<Set<number>>(new Set());
 
   useEffect(() => { onLandedRef.current = onLanded; }, [onLanded]);
 
+  // ── Reset sinkSet when a rematch resets all cups ────────────────────────
+  const prevRemovedCountRef = useRef(0);
+  useEffect(() => {
+    const removedCount = cups.filter(c => c.removed).length;
+    if (removedCount === 0 && prevRemovedCountRef.current > 0) {
+      setSinkSet(new Set());
+      stateRef.current.phase = 'idle';
+    }
+    prevRemovedCountRef.current = removedCount;
+  }, [cups]);
+
   useImperativeHandle(ref, () => ({
     startFlight(cupId, targetPos) {
-      // Ignore if ball is already mid-air — prevents double-start
-      if (stateRef.current.phase === 'flying') return;
+      if (stateRef.current.phase === 'flying' || stateRef.current.phase === 'entering') return;
+      // Aim at the cup's rim opening, not its geometric center
+      const rimTarget = new THREE.Vector3(targetPos.x, CUP_RIM_Y + BALL_R * 0.15, targetPos.z);
       stateRef.current = {
         phase: 'flying', elapsed: 0,
-        targetPos: targetPos.clone(), isHit: false,
+        targetPos: rimTarget, targetCupId: cupId, isHit: false,
       };
       resultRef.current = null;
       if (ballRef.current) ballRef.current.position.copy(BALL_START);
@@ -160,37 +204,31 @@ const BallRenderer = forwardRef<
     },
   }));
 
-  // Restore ball to rest when idle
-  useEffect(() => {
-    if (ballRef.current) ballRef.current.position.copy(BALL_START);
-  }, []);
-
   useFrame((_, dt) => {
     const s = stateRef.current;
 
-    // Keep shadow hidden when idle
     if (s.phase === 'idle') {
-      if (shadowRef.current) (shadowRef.current.material as THREE.MeshBasicMaterial).opacity = 0;
+      // Ball rests at start position, shadow hidden
       if (ballRef.current) ballRef.current.position.copy(BALL_START);
+      if (shadowRef.current) (shadowRef.current.material as THREE.MeshBasicMaterial).opacity = 0;
       return;
     }
 
     s.elapsed += dt;
 
+    // ── Phase 1: arc flight to cup rim ──────────────────────────────────────
     if (s.phase === 'flying') {
       const raw  = Math.min(s.elapsed / FLIGHT_S, 1);
       const ease = easeInOut(raw);
       const x    = lerp(BALL_START.x, s.targetPos.x, ease);
       const z    = lerp(BALL_START.z, s.targetPos.z, ease);
-      // Parabolic arc: peak at midpoint, lands at cup height
       const arcY = BALL_START.y
         + ARC_HEIGHT * 4 * raw * (1 - raw)
         + (s.targetPos.y - BALL_START.y) * ease;
 
       if (ballRef.current) ballRef.current.position.set(x, arcY, z);
 
-      // Shadow shrinks as ball rises, grows as it falls
-      const height = arcY - TABLE_Y;
+      const height  = arcY - TABLE_Y;
       const shadowSc = Math.max(0.05, 1 - height / (ARC_HEIGHT * 1.5));
       if (shadowRef.current) {
         shadowRef.current.position.set(x, TABLE_Y + 0.001, z);
@@ -199,50 +237,76 @@ const BallRenderer = forwardRef<
       }
 
       if (raw >= 1) {
-        // Ball has arrived — consume result or timeout
-        const result = resultRef.current;
-        const timedOut = s.elapsed > FLIGHT_S + 0.2;
+        const result   = resultRef.current;
+        const timedOut = s.elapsed > FLIGHT_S + 0.20;
         if (result !== null || timedOut) {
-          const hit = result?.hit ?? false;
-          const cupId = result?.cupId ?? -1;
-          s.isHit   = hit;
-          s.phase   = 'result';
-          s.elapsed = 0;
-          onLandedRef.current(hit);            // ← result text shown NOW (ball just landed)
+          const hit   = result?.hit ?? false;
+          const cupId = result?.cupId ?? s.targetCupId;
+          s.isHit      = hit;
+          s.targetCupId = cupId;
+          s.elapsed    = 0;
+
           if (hit) {
-            setSinkSet(prev => new Set([...prev, cupId]));
-            if (ballRef.current) ballRef.current.position.copy(BALL_START); // snap back
+            // Transition to "entering cup" phase
+            s.phase = 'entering';
+          } else {
+            // Miss — bounce off and show result
+            s.phase = 'result';
+            onLandedRef.current(false);
           }
         }
       }
       return;
     }
 
+    // ── Phase 2a: ball sinks into cup (hit only) ─────────────────────────────
+    if (s.phase === 'entering') {
+      const raw  = Math.min(s.elapsed / ENTER_S, 1);
+      const ease = easeInOut(raw);
+      // Ball descends from just above rim to inside the cup base
+      const entryStartY = CUP_RIM_Y + BALL_R * 0.15;
+      const entryEndY   = TABLE_Y + CUP_BOT_R + BALL_R * 0.5;
+      const ey = lerp(entryStartY, entryEndY, ease);
+      if (ballRef.current) ballRef.current.position.set(s.targetPos.x, ey, s.targetPos.z);
+
+      // Shadow fades as ball sinks below rim
+      if (shadowRef.current) {
+        const ss = Math.max(0, (1 - raw) * 0.3);
+        (shadowRef.current.material as THREE.MeshBasicMaterial).opacity = ss;
+      }
+
+      if (raw >= 1) {
+        // Ball is fully inside — now trigger cup fly-away
+        setSinkSet(prev => new Set([...prev, s.targetCupId]));
+        onLandedRef.current(true);
+        s.phase   = 'result';
+        s.elapsed = 0;
+        // Snap ball back to start (out of sight while cup flies)
+        if (ballRef.current) ballRef.current.position.copy(BALL_START);
+        if (shadowRef.current) (shadowRef.current.material as THREE.MeshBasicMaterial).opacity = 0;
+      }
+      return;
+    }
+
+    // ── Phase 2b: result wrap-up ─────────────────────────────────────────────
     if (s.phase === 'result') {
       if (s.isHit) {
-        // Cup fly-away plays; ball snapped back to rest — just wait
-        if (s.elapsed > 0.65) {
-          stateRef.current.phase = 'idle';
-          if (shadowRef.current) (shadowRef.current.material as THREE.MeshBasicMaterial).opacity = 0;
-        }
+        // Cup fly-away is playing; ball already snapped to rest. Just wait.
+        if (s.elapsed > 0.65) stateRef.current.phase = 'idle';
       } else {
-        // Bounce: roll toward camera and lose height
+        // Bounce off table surface
         const raw = Math.min(s.elapsed / BOUNCE_S, 1);
         const bx  = s.targetPos.x + raw * 0.5;
         const bz  = s.targetPos.z + raw * 1.3;
-        const by  = TABLE_Y + BALL_R + Math.max(0,
-          0.50 * Math.sin(raw * Math.PI) * (1 - raw * 0.65),
-        );
+        const by  = TABLE_Y + BALL_R + Math.max(0, 0.50 * Math.sin(raw * Math.PI) * (1 - raw * 0.65));
         if (ballRef.current) ballRef.current.position.set(bx, by, bz);
-        const ss = Math.max(0, (1 - raw) * 0.6);
+        const ss = Math.max(0, (1 - raw) * 0.5);
         if (shadowRef.current) {
           shadowRef.current.position.set(bx, TABLE_Y + 0.001, bz);
           shadowRef.current.scale.setScalar(ss);
           (shadowRef.current.material as THREE.MeshBasicMaterial).opacity = ss * 0.4;
         }
-        if (raw >= 1) {
-          stateRef.current.phase = 'idle';
-        }
+        if (raw >= 1) stateRef.current.phase = 'idle';
       }
     }
   });
@@ -259,13 +323,13 @@ const BallRenderer = forwardRef<
         />
       ))}
 
-      {/* Ball — always visible; rests at BALL_START when idle */}
+      {/* Ball — always visible; at rest when idle */}
       <mesh ref={ballRef} position={BALL_START} castShadow>
         <sphereGeometry args={[BALL_R, 32, 16]} />
         <meshStandardMaterial color="#f2f2ee" roughness={0.22} metalness={0.04} />
       </mesh>
 
-      {/* Shadow */}
+      {/* Ground shadow */}
       <mesh ref={shadowRef} rotation={[-Math.PI / 2, 0, 0]} position={[0, TABLE_Y + 0.001, 4]}>
         <circleGeometry args={[BALL_R * 1.3, 16]} />
         <meshBasicMaterial color="#000" transparent opacity={0} depthWrite={false} />
@@ -275,7 +339,7 @@ const BallRenderer = forwardRef<
 });
 BallRenderer.displayName = 'BallRenderer';
 
-// ── Green table ───────────────────────────────────────────────────────────────
+// ── Table ─────────────────────────────────────────────────────────────────────
 function Table() {
   return (
     <group>
@@ -283,12 +347,10 @@ function Table() {
         <boxGeometry args={[TABLE_HW * 2, TABLE_THICK, TABLE_DEPTH]} />
         <meshStandardMaterial color="#1e6b14" roughness={0.85} metalness={0} />
       </mesh>
-      {/* Center line */}
       <mesh position={[0, TABLE_Y + 0.002, 0]} rotation={[-Math.PI / 2, 0, 0]}>
         <planeGeometry args={[0.03, TABLE_DEPTH * 0.95]} />
         <meshBasicMaterial color="#fff" opacity={0.18} transparent />
       </mesh>
-      {/* Player-end circle */}
       <mesh position={[0, TABLE_Y + 0.002, 3.5]} rotation={[-Math.PI / 2, 0, 0]}>
         <ringGeometry args={[0.55, 0.58, 32]} />
         <meshBasicMaterial color="#fff" opacity={0.12} transparent />
@@ -297,7 +359,7 @@ function Table() {
   );
 }
 
-// ── Camera & renderer setup ───────────────────────────────────────────────────
+// ── Camera + renderer setup ───────────────────────────────────────────────────
 function SceneSetup() {
   const { camera, gl } = useThree();
   useEffect(() => {
@@ -335,43 +397,23 @@ const SceneContents = forwardRef<
 ));
 SceneContents.displayName = 'SceneContents';
 
-// ── Outer component: swipe handling + canvas ──────────────────────────────────
+// ── Outer: swipe handling + projection ───────────────────────────────────────
 export default function GameScene3D({ cups, isMyTurn, onThrow, lastThrow }: Props) {
   const containerRef  = useRef<HTMLDivElement>(null);
   const sweepRef      = useRef<{ x: number; y: number; t: number } | null>(null);
   const sceneRef      = useRef<SceneHandle>(null);
-  const localThrowRef = useRef(false);   // true when THIS player started the current throw
-  const [size, setSize] = useState({ w: 375, h: 500 });
+  const localThrowRef = useRef(false);
+  const [size, setSize]       = useState({ w: 375, h: 500 });
   const [throwing, setThrowing] = useState(false);
   const [showResult, setShowResult] = useState<'hit' | 'miss' | null>(null);
 
-  // ── Result flash: shown only when ball lands (via onLanded callback) ──────
+  // Result fires via onLanded — only after ball physically reaches cup
   const onLanded = useCallback((hit: boolean) => {
     setShowResult(hit ? 'hit' : 'miss');
     setTimeout(() => setShowResult(null), 1300);
   }, []);
 
-  // ── Spectator ball animation + result for ALL players ─────────────────────
-  const prevThrowRef = useRef<typeof lastThrow>(null);
-  useEffect(() => {
-    if (!lastThrow || lastThrow === prevThrowRef.current) return;
-    prevThrowRef.current = lastThrow;
-
-    const numRows = numRowsFromCups(cups);
-    const targetCup = cups.find(c => c.id === lastThrow.cupId);
-    if (!targetCup) return;
-    const targetPos = cupWorldPos(targetCup, numRows);
-
-    if (!localThrowRef.current) {
-      // Spectating player: start the full animation now
-      sceneRef.current?.startFlight(lastThrow.cupId, targetPos);
-    }
-    // Both throwing and spectating: queue the result (consumed when ball lands)
-    sceneRef.current?.notifyResult(lastThrow.hit, lastThrow.cupId);
-    localThrowRef.current = false;
-  }, [lastThrow, cups]);
-
-  // ── Resize observer ───────────────────────────────────────────────────────
+  // Resize observer
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
@@ -383,7 +425,7 @@ export default function GameScene3D({ cups, isMyTurn, onThrow, lastThrow }: Prop
     return () => ro.disconnect();
   }, []);
 
-  // ── Projection camera (matches scene camera) for 2D hit-testing ──────────
+  // Projection camera (mirrors Canvas camera exactly)
   const projCam = useMemo(() => {
     const cam = new THREE.PerspectiveCamera(CAM_FOV, size.w / size.h, 0.1, 100);
     cam.position.set(...CAM_POS);
@@ -393,7 +435,10 @@ export default function GameScene3D({ cups, isMyTurn, onThrow, lastThrow }: Prop
     return cam;
   }, [size.w, size.h]);
 
-  // ── Aim calculation ───────────────────────────────────────────────────────
+  // ── Aim computation: angle-based targeting ──────────────────────────────────
+  // Using atan2 angle-matching instead of perpendicular distance eliminates the
+  // "near-cup bias" where cups close to the ball (lower on screen) intercept
+  // swipes aimed at far cups. Angle from ball→cup matched against swipe angle.
   const computeAim = useCallback((dx: number, dy: number) => {
     const d = Math.hypot(dx, dy);
     if (d < MIN_SWIPE) return null;
@@ -403,39 +448,73 @@ export default function GameScene3D({ cups, isMyTurn, onThrow, lastThrow }: Prop
     const numRows = numRowsFromCups(cups);
     const { w, h } = size;
 
-    const b2d = project2D(BALL_START, projCam, w, h);
+    // 2D projection of the ball's rest position (swipe origin for angle calc)
+    const b2d      = project2D(BALL_START, projCam, w, h);
+    const swipeAng = Math.atan2(dir.y, dir.x);
 
-    let best = avail[0];
-    let bestPerp = Infinity;
+    // Find cup whose 2D angle from ball best matches the swipe angle
+    let best        = avail[0];
+    let bestAngDiff = Infinity;
+    let bestDist2d  = 1;
+
     for (const cup of avail) {
-      const c2d = project2D(cupWorldPos(cup, numRows), projCam, w, h);
-      const vx  = c2d.x - b2d.x, vy = c2d.y - b2d.y;
-      const t   = vx * dir.x + vy * dir.y;
-      if (t <= 0) continue;
-      const perp = Math.abs(vx * dir.y - vy * dir.x);
-      if (perp < bestPerp) { bestPerp = perp; best = cup; }
+      const c2d  = project2D(cupWorldPos(cup, numRows), projCam, w, h);
+      const vx   = c2d.x - b2d.x;
+      const vy   = c2d.y - b2d.y;
+      // Only consider cups in the forward hemisphere of the swipe
+      if (vx * dir.x + vy * dir.y <= 0) continue;
+      const cupAng = Math.atan2(vy, vx);
+      const diff   = angleDiff(swipeAng, cupAng);
+      if (diff < bestAngDiff) {
+        bestAngDiff = diff;
+        best = cup;
+        bestDist2d = Math.hypot(vx, vy);
+      }
     }
 
-    // Projected cup rim width → hit-zone tiers
+    // Angular accuracy zones — cup's angular half-size from ball in screen space
     const bestPos = cupWorldPos(best, numRows);
-    const s0 = project2D(bestPos.clone().sub(new THREE.Vector3(CUP_TOP_R, 0, 0)), projCam, w, h);
-    const s1 = project2D(bestPos.clone().add(new THREE.Vector3(CUP_TOP_R, 0, 0)), projCam, w, h);
-    const rimPx = Math.abs(s1.x - s0.x) / 2;
+    const cupLeft  = project2D(bestPos.clone().sub(new THREE.Vector3(CUP_TOP_R, 0, 0)), projCam, w, h);
+    const cupRight = project2D(bestPos.clone().add(new THREE.Vector3(CUP_TOP_R, 0, 0)), projCam, w, h);
+    const rimPx    = Math.abs(cupRight.x - cupLeft.x) / 2;  // screen-space rim radius
 
-    const rimR  = rimPx * 0.60;
-    const bodyR = rimPx * 1.05;
-    const nearR = rimPx * 1.65;
+    // Convert rim pixel radius to angular size (in radians from ball's perspective)
+    const rimAngular = rimPx / Math.max(1, bestDist2d);
+
+    const rimR  = rimAngular * 0.60;
+    const bodyR = rimAngular * 1.05;
+    const nearR = rimAngular * 1.65;
 
     let accuracy: number;
-    if      (bestPerp <= rimR)  accuracy = 0.82 + (1 - bestPerp / rimR) * 0.18;
-    else if (bestPerp <= bodyR) accuracy = 0.82 - Math.pow((bestPerp - rimR) / (bodyR - rimR), 0.65) * 0.62;
-    else if (bestPerp <= nearR) accuracy = 0.20 - ((bestPerp - bodyR) / (nearR - bodyR)) * 0.19;
-    else                        accuracy = 0;
+    if      (bestAngDiff <= rimR)  accuracy = 0.82 + (1 - bestAngDiff / rimR) * 0.18;
+    else if (bestAngDiff <= bodyR) accuracy = 0.82 - Math.pow((bestAngDiff - rimR) / (bodyR - rimR), 0.65) * 0.62;
+    else if (bestAngDiff <= nearR) accuracy = 0.20 - ((bestAngDiff - bodyR) / (nearR - bodyR)) * 0.19;
+    else                           accuracy = 0;
 
-    return { cup: best, accuracy, targetPos: bestPos };
+    return { cup: best, accuracy, targetPos: cupWorldPos(best, numRows) };
   }, [cups, projCam, size]);
 
-  // ── Swipe handlers ────────────────────────────────────────────────────────
+  // ── Spectator ball animation ─────────────────────────────────────────────
+  const prevThrowRef = useRef<typeof lastThrow>(null);
+  useEffect(() => {
+    if (!lastThrow || lastThrow === prevThrowRef.current) return;
+    prevThrowRef.current = lastThrow;
+
+    const numRows   = numRowsFromCups(cups);
+    const targetCup = cups.find(c => c.id === lastThrow.cupId);
+    if (!targetCup) return;
+    const targetPos = cupWorldPos(targetCup, numRows);
+
+    if (!localThrowRef.current) {
+      // This player is a spectator — start the animation now
+      sceneRef.current?.startFlight(lastThrow.cupId, targetPos);
+    }
+    // Both thrower and spectator: queue the outcome (consumed when ball lands)
+    sceneRef.current?.notifyResult(lastThrow.hit, lastThrow.cupId);
+    localThrowRef.current = false;
+  }, [lastThrow, cups]);
+
+  // ── Swipe handlers ───────────────────────────────────────────────────────
   const handlePointerDown = useCallback((e: React.PointerEvent) => {
     if (!isMyTurn || throwing) return;
     sweepRef.current = { x: e.clientX, y: e.clientY, t: performance.now() };
@@ -449,7 +528,7 @@ export default function GameScene3D({ cups, isMyTurn, onThrow, lastThrow }: Prop
     const dx  = e.clientX - sx;
     const dy  = e.clientY - sy;
     const dt  = Math.max(1, performance.now() - st);
-    // Velocity contributes only 10% — direction is what matters for accuracy
+    // Direction is 90% of accuracy; velocity is 10%
     const vel      = Math.hypot(dx, dy) / dt;
     const powerAcc = Math.min(1, Math.max(0.1, (vel - MIN_VEL) / 0.80));
 
@@ -458,12 +537,12 @@ export default function GameScene3D({ cups, isMyTurn, onThrow, lastThrow }: Prop
 
     const finalAcc = aim.accuracy * 0.90 + powerAcc * 0.10;
 
-    localThrowRef.current = true;              // mark: WE started this throw
+    localThrowRef.current = true;
     setThrowing(true);
     sceneRef.current?.startFlight(aim.cup.id, aim.targetPos);
     onThrow(aim.cup.id, finalAcc);
 
-    setTimeout(() => setThrowing(false), (FLIGHT_S + BOUNCE_S + 0.4) * 1000);
+    setTimeout(() => setThrowing(false), (FLIGHT_S + ENTER_S + BOUNCE_S + 0.5) * 1000);
   }, [isMyTurn, throwing, computeAim, onThrow]);
 
   return (
@@ -498,7 +577,7 @@ export default function GameScene3D({ cups, isMyTurn, onThrow, lastThrow }: Prop
         </div>
       )}
 
-      {/* Result flash — only appears once ball lands */}
+      {/* Result flash — fires via onLanded, only when ball reaches cup */}
       {showResult && (
         <div
           key={showResult + Date.now()}
