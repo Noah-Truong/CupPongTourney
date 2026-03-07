@@ -6,19 +6,17 @@ const { v4: uuidv4 } = require('uuid');
 
 const dev = process.env.NODE_ENV !== 'production';
 const port = parseInt(process.env.PORT || '3000', 10);
-// Always bind to all interfaces — required for Railway and any containerised host.
-// Never pass hostname/port to next() when using a custom HTTP server; those options
-// only apply when Next.js manages its own server and cause request filtering otherwise.
 const BIND_ADDRESS = '0.0.0.0';
 
-const app = next({ dev });
-const handle = app.getRequestHandler();
+console.log(`> Starting Cup Pong server (NODE_ENV=${process.env.NODE_ENV || 'development'}, PORT=${port})`);
 
-// roomId → room
-const rooms = new Map();
-// persistentId → { roomId, disconnectTimer }
-const reconnectMap = new Map();
+const nextApp = next({ dev });
+const handle = nextApp.getRequestHandler();
 
+// ─── Game state ───────────────────────────────────────────────────────────────
+
+const rooms = new Map();       // roomId → room
+const reconnectMap = new Map(); // persistentId → { roomId, timer }
 const RECONNECT_GRACE_MS = 15_000;
 
 function createCups() {
@@ -84,7 +82,6 @@ function joinRoom(roomId, playerName, socketId, persistentId) {
   return { room };
 }
 
-// Serialise the room for the client (replace socketId with a stable id field)
 function serializeRoom(room) {
   return {
     ...room,
@@ -147,123 +144,143 @@ function handleThrow(room, throwingSocketId, targetCupId, meterValue) {
   return { success, removedCupId, room };
 }
 
-app.prepare().then(() => {
-  const httpServer = createServer((req, res) => {
-    const parsedUrl = parse(req.url, true);
-    handle(req, res, parsedUrl);
+// ─── HTTP server — starts listening IMMEDIATELY ───────────────────────────────
+// This ensures Railway's healthcheck can connect as soon as the process starts,
+// even while app.prepare() is still running in the background.
+
+let nextReady = false;
+
+const httpServer = createServer((req, res) => {
+  if (!nextReady) {
+    // Next.js is still warming up. Return 200 for the healthcheck path so Railway
+    // knows the process is alive; everything else gets a temporary 503.
+    if (req.url === '/' || req.url === '/health') {
+      res.writeHead(200, { 'Content-Type': 'text/plain' });
+      res.end('Starting...');
+    } else {
+      res.writeHead(503, { 'Content-Type': 'text/plain' });
+      res.end('Starting...');
+    }
+    return;
+  }
+  const parsedUrl = parse(req.url, true);
+  handle(req, res, parsedUrl);
+});
+
+// Socket.io attaches to the raw HTTP server — independent of Next.js readiness.
+const io = new Server(httpServer, {
+  cors: { origin: '*' },
+});
+
+io.on('connection', (socket) => {
+  console.log('Connected:', socket.id);
+
+  socket.on('create-room', (playerName, persistentId) => {
+    const room = createRoom(playerName, socket.id, persistentId);
+    socket.join(room.id);
+    socket.emit('room-created', serializeRoom(room));
   });
 
-  const io = new Server(httpServer, {
-    cors: { origin: '*' },
+  socket.on('join-room', (roomId, playerName, persistentId) => {
+    const result = joinRoom(roomId.trim().toUpperCase(), playerName, socket.id, persistentId);
+    if (result.error) {
+      socket.emit('error', result.error);
+      return;
+    }
+    socket.join(result.room.id);
+    io.to(result.room.id).emit('game-started', serializeRoom(result.room));
   });
 
-  io.on('connection', (socket) => {
-    console.log('Connected:', socket.id);
+  socket.on('get-room', (roomId, persistentId) => {
+    const room = rooms.get(roomId);
+    if (!room) {
+      socket.emit('error', 'Room not found. It may have expired.');
+      return;
+    }
 
-    socket.on('create-room', (playerName, persistentId) => {
-      const room = createRoom(playerName, socket.id, persistentId);
-      socket.join(room.id);
-      socket.emit('room-created', serializeRoom(room));
-    });
+    const playerIdx = room.players.findIndex(p => p.persistentId === persistentId);
+    if (playerIdx !== -1) {
+      room.players[playerIdx].socketId = socket.id;
 
-    socket.on('join-room', (roomId, playerName, persistentId) => {
-      const result = joinRoom(roomId.trim().toUpperCase(), playerName, socket.id, persistentId);
-      if (result.error) {
-        socket.emit('error', result.error);
-        return;
+      const entry = reconnectMap.get(persistentId);
+      if (entry?.timer) {
+        clearTimeout(entry.timer);
+        entry.timer = null;
+        socket.to(room.id).emit('opponent-reconnected');
       }
-      socket.join(result.room.id);
-      io.to(result.room.id).emit('game-started', serializeRoom(result.room));
+    }
+
+    socket.join(roomId);
+    socket.emit('room-state', serializeRoom(room));
+  });
+
+  socket.on('throw-ball', (roomId, targetCupId, meterValue) => {
+    const room = rooms.get(roomId);
+    if (!room) { socket.emit('error', 'Room not found.'); return; }
+    const result = handleThrow(room, socket.id, targetCupId, meterValue);
+    if (result.error) { socket.emit('error', result.error); return; }
+    io.to(roomId).emit('throw-result', {
+      success: result.success,
+      removedCupId: result.removedCupId,
+      room: serializeRoom(result.room),
     });
+  });
 
-    socket.on('get-room', (roomId, persistentId) => {
-      const room = rooms.get(roomId);
-      if (!room) {
-        socket.emit('error', 'Room not found. It may have expired.');
-        return;
-      }
+  socket.on('rematch', (roomId) => {
+    const room = rooms.get(roomId);
+    if (!room || room.status !== 'finished') return;
+    room.players.forEach(p => { p.cups = createCups(); });
+    room.status = 'playing';
+    room.currentPlayerIndex = 0;
+    room.turnState = { ballsThrown: 0, ballsMade: 0, bonusTurn: false };
+    room.winner = null;
+    room.winnerPersistentId = null;
+    room.gameLog = ['Rematch started!', `${room.players[0].name}'s turn.`];
+    io.to(roomId).emit('game-started', serializeRoom(room));
+  });
 
-      // If a player is reconnecting, update their socket ID and cancel their disconnect timer
-      const playerIdx = room.players.findIndex(p => p.persistentId === persistentId);
-      if (playerIdx !== -1) {
-        room.players[playerIdx].socketId = socket.id;
+  socket.on('disconnect', () => {
+    console.log('Disconnected:', socket.id);
 
-        const entry = reconnectMap.get(persistentId);
-        if (entry?.timer) {
-          clearTimeout(entry.timer);
-          entry.timer = null;
-          // Let the other player know the connection is back
-          socket.to(room.id).emit('opponent-reconnected');
-        }
-      }
+    for (const [roomId, room] of rooms.entries()) {
+      const playerIdx = room.players.findIndex(p => p.socketId === socket.id);
+      if (playerIdx === -1) continue;
 
-      socket.join(roomId);
-      socket.emit('room-state', serializeRoom(room));
-    });
+      const player = room.players[playerIdx];
 
-    socket.on('throw-ball', (roomId, targetCupId, meterValue) => {
-      const room = rooms.get(roomId);
-      if (!room) { socket.emit('error', 'Room not found.'); return; }
-      const result = handleThrow(room, socket.id, targetCupId, meterValue);
-      if (result.error) { socket.emit('error', result.error); return; }
-      io.to(roomId).emit('throw-result', {
-        success: result.success,
-        removedCupId: result.removedCupId,
-        room: serializeRoom(result.room),
-      });
-    });
-
-    socket.on('rematch', (roomId) => {
-      const room = rooms.get(roomId);
-      if (!room || room.status !== 'finished') return;
-      room.players.forEach(p => { p.cups = createCups(); });
-      room.status = 'playing';
-      room.currentPlayerIndex = 0;
-      room.turnState = { ballsThrown: 0, ballsMade: 0, bonusTurn: false };
-      room.winner = null;
-      room.winnerPersistentId = null;
-      room.gameLog = ['Rematch started!', `${room.players[0].name}'s turn.`];
-      io.to(roomId).emit('game-started', serializeRoom(room));
-    });
-
-    socket.on('disconnect', () => {
-      console.log('Disconnected:', socket.id);
-
-      for (const [roomId, room] of rooms.entries()) {
-        const playerIdx = room.players.findIndex(p => p.socketId === socket.id);
-        if (playerIdx === -1) continue;
-
-        const player = room.players[playerIdx];
-
-        if (room.status === 'finished') {
-          // No need to hold the room open after game ends
-          rooms.delete(roomId);
-          reconnectMap.delete(player.persistentId);
-          break;
-        }
-
-        // Give the player a window to reconnect before declaring them gone
-        io.to(roomId).emit('opponent-disconnected', 'Opponent disconnected. Waiting for them to reconnect...');
-
-        const entry = reconnectMap.get(player.persistentId);
-        if (entry) {
-          entry.timer = setTimeout(() => {
-            if (rooms.has(roomId)) {
-              io.to(roomId).emit('player-left', 'Opponent failed to reconnect. Game over.');
-              rooms.delete(roomId);
-            }
-            reconnectMap.delete(player.persistentId);
-          }, RECONNECT_GRACE_MS);
-        }
+      if (room.status === 'finished') {
+        rooms.delete(roomId);
+        reconnectMap.delete(player.persistentId);
         break;
       }
-    });
-  });
 
-  httpServer.listen(port, BIND_ADDRESS, () => {
-    console.log(`> Ready on http://localhost:${port}`);
+      io.to(roomId).emit('opponent-disconnected', 'Opponent disconnected. Waiting for them to reconnect...');
+
+      const entry = reconnectMap.get(player.persistentId);
+      if (entry) {
+        entry.timer = setTimeout(() => {
+          if (rooms.has(roomId)) {
+            io.to(roomId).emit('player-left', 'Opponent failed to reconnect. Game over.');
+            rooms.delete(roomId);
+          }
+          reconnectMap.delete(player.persistentId);
+        }, RECONNECT_GRACE_MS);
+      }
+      break;
+    }
   });
+});
+
+// Listen immediately — don't wait for Next.js.
+httpServer.listen(port, BIND_ADDRESS, () => {
+  console.log(`> Listening on ${BIND_ADDRESS}:${port} — preparing Next.js...`);
+});
+
+// Prepare Next.js in the background. Once ready, swap in the real handler.
+nextApp.prepare().then(() => {
+  nextReady = true;
+  console.log(`> Next.js ready — fully operational on port ${port}`);
 }).catch((err) => {
-  console.error('Server startup failed:', err);
+  console.error('> Next.js prepare() failed:', err);
   process.exit(1);
 });
