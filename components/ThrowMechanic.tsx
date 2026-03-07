@@ -99,6 +99,29 @@ export default function ThrowMechanic({
   );
 
   /**
+   * Auto-shrink cups so they always fit the available space on any screen size.
+   * Takes the lesser of the height-fit scale and the width-fit scale, capped at 1.0.
+   */
+  const layoutScale = useMemo(() => {
+    // Total cup height needed at full scale
+    let fullH = 0;
+    for (let r = 0; r < numRows; r++) {
+      const sc = FAR_SCALE + (1 - FAR_SCALE) * (r / Math.max(1, numRows - 1));
+      fullH += (BASE_CUP_H + BASE_CUP_GAP) * sc;
+    }
+    const availH = size.h - THROW_ZONE_H - CUP_AREA_PAD;
+    const scaleH = availH / fullH;
+
+    // Widest row is row 0 (most cups, smallest individual scale)
+    const topN  = numRows;
+    const topSc = FAR_SCALE;
+    const fullW = topN * BASE_CUP_W * topSc + (topN - 1) * BASE_CUP_GAP * topSc;
+    const scaleW = size.w / fullW;
+
+    return Math.min(1.0, scaleH, scaleW);
+  }, [size.h, size.w, numRows]);
+
+  /**
    * Compute layout for every cup. Returns a Map<cupId → {x,y,w,h}>.
    * The widest row (row 0, farthest) is at the top with small cups;
    * the single-cup row (row numRows-1, closest) is at the bottom with big cups.
@@ -108,9 +131,9 @@ export default function ThrowMechanic({
     let y = CUP_AREA_PAD;
     for (let row = 0; row < numRows; row++) {
       const sc   = rowScale(row);
-      const cw   = BASE_CUP_W * sc;
-      const ch   = BASE_CUP_H * sc;
-      const gap  = BASE_CUP_GAP * sc;
+      const cw   = BASE_CUP_W * sc * layoutScale;
+      const ch   = BASE_CUP_H * sc * layoutScale;
+      const gap  = BASE_CUP_GAP * sc * layoutScale;
       const cupsInRow = numRows - row;
       const totalW = cupsInRow * cw + (cupsInRow - 1) * gap;
       const startX = (size.w - totalW) / 2;
@@ -125,7 +148,7 @@ export default function ThrowMechanic({
       y += ch + gap;
     }
     return map;
-  }, [cups, numRows, rowScale, size.w]);
+  }, [cups, numRows, rowScale, layoutScale, size.w]);
 
   const getCupCenter = useCallback((cup: Cup) => {
     const l = cupLayout.get(cup.id);
@@ -161,7 +184,7 @@ export default function ThrowMechanic({
     // bodyR = cup body edge       (~52% of cup width)
     // nearR = near-miss boundary  (~80% of cup width)
     const sc    = rowScale(best.row);
-    const cw    = BASE_CUP_W * sc;
+    const cw    = BASE_CUP_W * sc * layoutScale;
     const rimR  = cw * 0.30;
     const bodyR = cw * 0.52;
     const nearR = cw * 0.80;
@@ -182,7 +205,7 @@ export default function ThrowMechanic({
       accuracy = 0;
     }
     return { cup: best, accuracy };
-  }, [cups, getCupCenter, ballX, ballY, rowScale]);
+  }, [cups, getCupCenter, ballX, ballY, rowScale, layoutScale]);
 
   // ── RAF ball arc animation ────────────────────────────────────────────────
   const startFlight = useCallback((
@@ -393,10 +416,10 @@ export default function ThrowMechanic({
     let h = CUP_AREA_PAD;
     for (let row = 0; row < numRows; row++) {
       const sc = rowScale(row);
-      h += BASE_CUP_H * sc + BASE_CUP_GAP * sc;
+      h += (BASE_CUP_H + BASE_CUP_GAP) * sc * layoutScale;
     }
     return h;
-  }, [numRows, rowScale]);
+  }, [numRows, rowScale, layoutScale]);
 
   return (
     <div
