@@ -72,11 +72,46 @@ function project2D(
   return { x: (s.x + 1) / 2 * w, y: (-s.y + 1) / 2 * h };
 }
 
-/** Minimum angular difference between two angles (result in [0, π]). */
-function angleDiff(a: number, b: number): number {
-  let d = Math.abs(a - b) % (2 * Math.PI);
-  if (d > Math.PI) d = 2 * Math.PI - d;
-  return d;
+/**
+ * Cast a ray through the swipe direction and find where it lands on a
+ * horizontal plane at y = planeY.  Returns null when the ray is nearly
+ * parallel to the plane (shouldn't happen for forward swipes).
+ */
+function swipeRayToPlane(
+  dir: { x: number; y: number },
+  b2d: { x: number; y: number },
+  cam: THREE.Camera,
+  w: number,
+  h: number,
+  planeY: number,
+): THREE.Vector3 | null {
+  // Project a point that is PROJ_SCALE * screen-height ahead of the ball
+  // along the swipe direction. This gives us a 2D "aim point" on screen
+  // whose 3D ray we intersect with the cup-rim plane.
+  const PROJ_SCALE = 0.72;
+  const projDist = h * PROJ_SCALE;
+  const ax = b2d.x + dir.x * projDist;
+  const ay = b2d.y + dir.y * projDist;
+
+  // Convert to NDC [-1, 1]
+  const ndcX = (ax / w) * 2 - 1;
+  const ndcY = -(ay / h) * 2 + 1;
+
+  // Unproject two depths to get a ray
+  const near = new THREE.Vector3(ndcX, ndcY, 0).unproject(cam);
+  const far  = new THREE.Vector3(ndcX, ndcY, 1).unproject(cam);
+  const rayDir = far.sub(near).normalize();
+
+  // Intersect y = planeY:  origin.y + t * rayDir.y = planeY
+  if (Math.abs(rayDir.y) < 1e-6) return null;
+  const t = (planeY - cam.position.y) / rayDir.y;
+  if (t < 0) return null;
+
+  return new THREE.Vector3(
+    cam.position.x + rayDir.x * t,
+    planeY,
+    cam.position.z + rayDir.z * t,
+  );
 }
 
 function lerp(a: number, b: number, t: number) { return a + (b - a) * t; }
@@ -163,7 +198,10 @@ type BallPhase = 'idle' | 'flying' | 'entering' | 'result';
 interface BallState {
   phase: BallPhase;
   elapsed: number;
-  targetPos: THREE.Vector3;   // rim-top position (adjusted from cup center)
+  /** Raw 3D landing point from the swipe ray (where ball ends its arc). */
+  targetPos: THREE.Vector3;
+  /** Cup center XZ, used during entering phase so ball descends into the cup. */
+  cupCenterPos: THREE.Vector3;
   targetCupId: number;
   isHit: boolean;
 }
@@ -176,7 +214,8 @@ const BallRenderer = forwardRef<
   const shadowRef  = useRef<THREE.Mesh>(null!);
   const stateRef   = useRef<BallState>({
     phase: 'idle', elapsed: 0,
-    targetPos: BALL_START.clone(), targetCupId: -1, isHit: false,
+    targetPos: BALL_START.clone(), cupCenterPos: BALL_START.clone(),
+    targetCupId: -1, isHit: false,
   });
   const resultRef   = useRef<{ hit: boolean; cupId: number } | null>(null);
   const onLandedRef = useRef(onLanded);
@@ -196,13 +235,18 @@ const BallRenderer = forwardRef<
   }, [cups]);
 
   useImperativeHandle(ref, () => ({
-    startFlight(cupId, targetPos) {
+    startFlight(cupId, landingPos) {
       if (stateRef.current.phase === 'flying' || stateRef.current.phase === 'entering') return;
-      // Aim at the cup's rim opening, not its geometric center
-      const rimTarget = new THREE.Vector3(targetPos.x, CUP_RIM_Y + BALL_R * 0.15, targetPos.z);
+      const numRows   = numRowsFromCups(cups);
+      const cup       = cups.find(c => c.id === cupId);
+      const center3d  = cup ? cupWorldPos(cup, numRows) : landingPos.clone();
+      // cupCenterPos: where ball descends into on a hit
+      const cupCenter = new THREE.Vector3(center3d.x, CUP_RIM_Y + BALL_R * 0.15, center3d.z);
+      // targetPos: where the ball arc actually lands (raw swipe direction)
+      const rawLand   = new THREE.Vector3(landingPos.x, CUP_RIM_Y + BALL_R * 0.15, landingPos.z);
       stateRef.current = {
         phase: 'flying', elapsed: 0,
-        targetPos: rimTarget, targetCupId: cupId, isHit: false,
+        targetPos: rawLand, cupCenterPos: cupCenter, targetCupId: cupId, isHit: false,
       };
       resultRef.current = null;
       if (ballRef.current) ballRef.current.position.copy(BALL_START);
@@ -271,11 +315,12 @@ const BallRenderer = forwardRef<
     if (s.phase === 'entering') {
       const raw  = Math.min(s.elapsed / ENTER_S, 1);
       const ease = easeInOut(raw);
-      // Ball descends from just above rim to inside the cup base
-      const entryStartY = CUP_RIM_Y + BALL_R * 0.15;
-      const entryEndY   = TABLE_Y + CUP_BOT_R + BALL_R * 0.5;
-      const ey = lerp(entryStartY, entryEndY, ease);
-      if (ballRef.current) ballRef.current.position.set(s.targetPos.x, ey, s.targetPos.z);
+      // Smoothly converge from landing point to cup center while descending
+      const entryEndY = TABLE_Y + CUP_BOT_R + BALL_R * 0.5;
+      const x  = lerp(s.targetPos.x, s.cupCenterPos.x, ease);
+      const z  = lerp(s.targetPos.z, s.cupCenterPos.z, ease);
+      const ey = lerp(CUP_RIM_Y + BALL_R * 0.15, entryEndY, ease);
+      if (ballRef.current) ballRef.current.position.set(x, ey, z);
 
       // Shadow fades as ball sinks below rim
       if (shadowRef.current) {
@@ -443,10 +488,11 @@ export default function GameScene3D({ cups, isMyTurn, onThrow, lastThrow }: Prop
     return cam;
   }, [size.w, size.h]);
 
-  // ── Aim computation: angle-based targeting ──────────────────────────────────
-  // Using atan2 angle-matching instead of perpendicular distance eliminates the
-  // "near-cup bias" where cups close to the ball (lower on screen) intercept
-  // swipes aimed at far cups. Angle from ball→cup matched against swipe angle.
+  // ── Aim computation: pure ray cast — zero aim assist ────────────────────────
+  // 1. Convert swipe direction to a 3D ray via camera unprojection.
+  // 2. Intersect the ray with y = CUP_RIM_Y (the cup opening plane).
+  // 3. Accuracy = purely geometric: how close the landing is to a cup center.
+  //    No snapping, no zone bias — if you aim inside the cup, you make it.
   const computeAim = useCallback((dx: number, dy: number) => {
     const d = Math.hypot(dx, dy);
     if (d < MIN_SWIPE) return null;
@@ -456,50 +502,32 @@ export default function GameScene3D({ cups, isMyTurn, onThrow, lastThrow }: Prop
     const numRows = numRowsFromCups(cups);
     const { w, h } = size;
 
-    // 2D projection of the ball's rest position (swipe origin for angle calc)
-    const b2d      = project2D(BALL_START, projCam, w, h);
-    const swipeAng = Math.atan2(dir.y, dir.x);
+    // Project ball's 2D screen position, use it as the swipe origin
+    const b2d = project2D(BALL_START, projCam, w, h);
 
-    // Find cup whose 2D angle from ball best matches the swipe angle
-    let best        = avail[0];
-    let bestAngDiff = Infinity;
-    let bestDist2d  = 1;
+    // Cast the swipe ray onto the cup-rim plane to get a raw 3D landing point
+    const landing = swipeRayToPlane(dir, b2d, projCam, w, h, CUP_RIM_Y);
+    if (!landing) return null;
 
+    // Find the nearest available cup to the landing point (in XZ)
+    let best     = avail[0];
+    let bestDist = Infinity;
     for (const cup of avail) {
-      const c2d  = project2D(cupWorldPos(cup, numRows), projCam, w, h);
-      const vx   = c2d.x - b2d.x;
-      const vy   = c2d.y - b2d.y;
-      // Only consider cups in the forward hemisphere of the swipe
-      if (vx * dir.x + vy * dir.y <= 0) continue;
-      const cupAng = Math.atan2(vy, vx);
-      const diff   = angleDiff(swipeAng, cupAng);
-      if (diff < bestAngDiff) {
-        bestAngDiff = diff;
-        best = cup;
-        bestDist2d = Math.hypot(vx, vy);
-      }
+      const cp   = cupWorldPos(cup, numRows);
+      const dist = Math.hypot(landing.x - cp.x, landing.z - cp.z);
+      if (dist < bestDist) { bestDist = dist; best = cup; }
     }
 
-    // Angular accuracy zones — cup's angular half-size from ball in screen space
-    const bestPos = cupWorldPos(best, numRows);
-    const cupLeft  = project2D(bestPos.clone().sub(new THREE.Vector3(CUP_TOP_R, 0, 0)), projCam, w, h);
-    const cupRight = project2D(bestPos.clone().add(new THREE.Vector3(CUP_TOP_R, 0, 0)), projCam, w, h);
-    const rimPx    = Math.abs(cupRight.x - cupLeft.x) / 2;  // screen-space rim radius
+    // Accuracy: linear in how close the landing is to the cup's rim opening.
+    // bestDist = 0 → dead center → accuracy 1.0
+    // bestDist = CUP_TOP_R → at rim edge → accuracy 0
+    // No zones, no artificial floors — the player's raw aim determines everything.
+    const accuracy = Math.max(0, 1 - bestDist / CUP_TOP_R);
 
-    // Convert rim pixel radius to angular size (in radians from ball's perspective)
-    const rimAngular = rimPx / Math.max(1, bestDist2d);
+    // Landing position carries the raw XZ (ball flies here, not to cup center)
+    const landingPos = new THREE.Vector3(landing.x, CUP_RIM_Y, landing.z);
 
-    const rimR  = rimAngular * 0.60;
-    const bodyR = rimAngular * 1.05;
-    const nearR = rimAngular * 1.65;
-
-    let accuracy: number;
-    if      (bestAngDiff <= rimR)  accuracy = 0.82 + (1 - bestAngDiff / rimR) * 0.18;
-    else if (bestAngDiff <= bodyR) accuracy = 0.82 - Math.pow((bestAngDiff - rimR) / (bodyR - rimR), 0.65) * 0.62;
-    else if (bestAngDiff <= nearR) accuracy = 0.20 - ((bestAngDiff - bodyR) / (nearR - bodyR)) * 0.19;
-    else                           accuracy = 0;
-
-    return { cup: best, accuracy, targetPos: cupWorldPos(best, numRows) };
+    return { cup: best, accuracy, targetPos: landingPos };
   }, [cups, projCam, size]);
 
   // ── Spectator ball animation ─────────────────────────────────────────────
@@ -536,14 +564,16 @@ export default function GameScene3D({ cups, isMyTurn, onThrow, lastThrow }: Prop
     const dx  = e.clientX - sx;
     const dy  = e.clientY - sy;
     const dt  = Math.max(1, performance.now() - st);
-    // Direction is 90% of accuracy; velocity is 10%
-    const vel      = Math.hypot(dx, dy) / dt;
-    const powerAcc = Math.min(1, Math.max(0.1, (vel - MIN_VEL) / 0.80));
+
+    // Minimum velocity gate: prevents accidental slow drags registering as throws
+    const vel = Math.hypot(dx, dy) / dt;
+    if (vel < MIN_VEL) return;
 
     const aim = computeAim(dx, dy);
     if (!aim) return;
 
-    const finalAcc = aim.accuracy * 0.90 + powerAcc * 0.10;
+    // Accuracy is purely geometric — wherever the swipe ray lands relative to cups
+    const finalAcc = aim.accuracy;
 
     localThrowRef.current = true;
     setThrowing(true);
