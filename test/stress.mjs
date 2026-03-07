@@ -404,6 +404,103 @@ async function testDisconnectGrace() {
   c1b.disconnect(); c2.disconnect();
 }
 
+// ─── Test 10: Throwing a 3rd ball is rejected ────────────────────────────────
+async function testOverThrowRejected() {
+  console.log('\n\x1b[1mTest 10: Over-throw Rejected (3rd ball)\x1b[0m');
+  const c1 = makeClient();
+  const c2 = makeClient();
+  await Promise.all([waitFor(c1, 'connect'), waitFor(c2, 'connect')]);
+
+  c1.emit('create-room', 'Spammer', uuidv4());
+  const room = await waitFor(c1, 'room-created');
+  c2.emit('join-room', room.id, 'Opp', uuidv4());
+  const started = await waitFor(c1, 'game-started');
+  const roomId = started.id;
+  const cups = started.players[1].cups;
+
+  c1.emit('throw-ball', roomId, cups[0].id, 99);
+  await waitFor(c1, 'throw-result');
+  c1.emit('throw-ball', roomId, cups[1].id, 99);
+  await waitFor(c1, 'throw-result');
+
+  // 3rd throw — should error
+  let errorReceived = false;
+  c1.once('error', () => { errorReceived = true; });
+  c1.emit('throw-ball', roomId, cups[2].id, 99);
+  await sleep(500);
+  assert(errorReceived, '3rd throw in same turn is rejected with error');
+
+  c1.disconnect(); c2.disconnect();
+}
+
+// ─── Test 11: Targeting already-removed cup is rejected ───────────────────────
+async function testRemovedCupRejected() {
+  console.log('\n\x1b[1mTest 11: Targeting a Removed Cup is Rejected\x1b[0m');
+  // Force-sink a cup at meter=1 (95% hit rate), retry until it sinks
+  let succeeded = false;
+  for (let attempt = 0; attempt < 10 && !succeeded; attempt++) {
+    const c1 = makeClient();
+    const c2 = makeClient();
+    await Promise.all([waitFor(c1, 'connect'), waitFor(c2, 'connect')]);
+
+    c1.emit('create-room', 'Sniper', uuidv4());
+    const room = await waitFor(c1, 'room-created');
+    c2.emit('join-room', room.id, 'Target', uuidv4());
+    const started = await waitFor(c1, 'game-started');
+    const roomId = started.id;
+    const cup = started.players[1].cups[0];
+
+    c1.emit('throw-ball', roomId, cup.id, 1);
+    const r1 = await waitFor(c1, 'throw-result');
+
+    if (r1.success) {
+      // Cup is now removed — try to target it again with ball 2
+      let errorReceived = false;
+      c1.once('error', () => { errorReceived = true; });
+      c1.emit('throw-ball', roomId, cup.id, 1);
+      await sleep(500);
+      assert(errorReceived, 'Targeting an already-removed cup is rejected');
+      succeeded = true;
+    }
+
+    c1.disconnect(); c2.disconnect();
+  }
+  if (!succeeded) {
+    console.log(`  ${INFO} Could not sink a cup in 10 attempts to test removed cup rejection`);
+  }
+}
+
+// ─── Test 12: Room expires after grace period ─────────────────────────────────
+async function testRoomExpiresAfterGrace() {
+  console.log('\n\x1b[1mTest 12: Room Expires After Grace Period\x1b[0m');
+  console.log(`  ${INFO} This test waits 16s for the 15s grace period to expire...`);
+  const c1 = makeClient();
+  const c2 = makeClient();
+  await Promise.all([waitFor(c1, 'connect'), waitFor(c2, 'connect')]);
+
+  c1.emit('create-room', 'Leaver', uuidv4());
+  const room = await waitFor(c1, 'room-created');
+  c2.emit('join-room', room.id, 'Waiter', uuidv4());
+  await waitFor(c1, 'game-started');
+
+  let playerLeftReceived = false;
+  c2.once('player-left', () => { playerLeftReceived = true; });
+
+  c1.disconnect(); // abruptly leave — don't reconnect
+  await sleep(16_000); // wait past the 15s grace period
+
+  assert(playerLeftReceived, 'P2 receives player-left after grace period expires');
+
+  // Verify the room is gone: new client tries to get it
+  const c3 = makeClient();
+  await waitFor(c3, 'connect');
+  c3.emit('get-room', room.id, uuidv4());
+  const result = await waitForAny(c3, ['room-state', 'error']);
+  assert(result.event === 'error', 'Expired room returns error on get-room');
+
+  c2.disconnect(); c3.disconnect();
+}
+
 // ─── Run all tests ─────────────────────────────────────────────────────────────
 async function run() {
   console.log('\x1b[1m\x1b[36m══════════════════════════════════\x1b[0m');
@@ -420,6 +517,9 @@ async function run() {
     await testConcurrentRooms();
     await testRematch();
     await testDisconnectGrace();
+    await testOverThrowRejected();
+    await testRemovedCupRejected();
+    await testRoomExpiresAfterGrace();
   } catch (e) {
     console.error(`\n${FAIL} Unexpected error: ${e.message}`);
     failed++;

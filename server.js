@@ -5,11 +5,13 @@ const { Server } = require('socket.io');
 const { v4: uuidv4 } = require('uuid');
 
 const dev = process.env.NODE_ENV !== 'production';
-// Use 0.0.0.0 so the server accepts connections from all interfaces (required for Railway and LAN play)
-const hostname = process.env.HOSTNAME || '0.0.0.0';
 const port = parseInt(process.env.PORT || '3000', 10);
+// Always bind to 0.0.0.0 — never use process.env.HOSTNAME which on Linux containers
+// is set to the container's internal hex hostname (not a valid bind address).
+const BIND_ADDRESS = '0.0.0.0';
 
-const app = next({ dev, hostname, port });
+// Next.js uses 'hostname' internally for URL construction — keep it as localhost.
+const app = next({ dev, hostname: 'localhost', port });
 const handle = app.getRequestHandler();
 
 // roomId → room
@@ -258,7 +260,7 @@ app.prepare().then(() => {
     });
   });
 
-  httpServer.listen(port, hostname, () => {
+  httpServer.listen(port, BIND_ADDRESS, () => {
     console.log(`> Ready on http://localhost:${port}`);
   });
 });
