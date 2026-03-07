@@ -81,7 +81,9 @@ function serializeRoom(room) {
   return {
     ...room,
     players: room.players.map(p => ({ id: p.persistentId, name: p.name, score: p.score })),
-    winner: room.winnerPersistentId,
+    winner:      room.winnerPersistentId,
+    tied:        room.tied        ?? false,
+    tiedPlayers: room.tiedPlayers ?? [],
   };
 }
 
@@ -111,13 +113,21 @@ function handleThrow(room, throwingSocketId, targetCupId, accuracy) {
     );
 
     if (remaining === 0) {
-      const winner = room.players.reduce(
-        (best, p) => (p.score > best.score ? p : best),
-        room.players[0]
-      );
-      room.winnerPersistentId = winner.persistentId;
       room.status = 'finished';
-      room.gameLog.push(`${winner.name} wins with ${winner.score} cup${winner.score !== 1 ? 's' : ''}!`);
+      const maxScore  = Math.max(...room.players.map(p => p.score));
+      const topPlayers = room.players.filter(p => p.score === maxScore);
+      if (topPlayers.length === 1) {
+        room.winnerPersistentId = topPlayers[0].persistentId;
+        room.tied        = false;
+        room.tiedPlayers = [];
+        room.gameLog.push(`${topPlayers[0].name} wins with ${maxScore} cup${maxScore !== 1 ? 's' : ''}!`);
+      } else {
+        room.winnerPersistentId = null;
+        room.tied        = true;
+        room.tiedPlayers = topPlayers.map(p => p.persistentId);
+        const names = topPlayers.map(p => p.name).join(' & ');
+        room.gameLog.push(`It's a tie! ${names} both sank ${maxScore} cup${maxScore !== 1 ? 's' : ''}.`);
+      }
     }
   } else {
     room.gameLog.push(`${currentPlayer.name} missed.`);
@@ -253,6 +263,8 @@ io.on('connection', (socket) => {
     room.turnState = { ballsThrown: 0, ballsMade: 0, bonusTurn: false };
     room.winner = null;
     room.winnerPersistentId = null;
+    room.tied        = false;
+    room.tiedPlayers = [];
     const total = room.sharedCups.length;
     room.gameLog = [`Rematch! ${total} cups back in play.`, `${room.players[0].name}'s turn.`];
     io.to(roomId).emit('game-started', serializeRoom(room));

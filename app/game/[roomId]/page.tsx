@@ -2,10 +2,19 @@
 
 import { Suspense, use, useCallback, useEffect, useRef, useState } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
+import dynamic from 'next/dynamic';
 import { disconnectSocket, getPersistentId, getSocket } from '@/lib/socket';
 import { GameRoom } from '@/types/game';
-import ThrowMechanic from '@/components/ThrowMechanic';
 import GameLog from '@/components/GameLog';
+
+const GameScene3D = dynamic(() => import('@/components/GameScene3D'), {
+  ssr: false,
+  loading: () => (
+    <div className="flex-1 flex items-center justify-center bg-[#0f1117]">
+      <div className="w-8 h-8 border-2 border-red-500 border-t-transparent rounded-full animate-spin" />
+    </div>
+  ),
+});
 
 interface PageProps { params: Promise<{ roomId: string }> }
 
@@ -194,12 +203,22 @@ function GamePageInner({ params }: PageProps) {
     );
   }
 
+  // ── Tie detection helpers ──────────────────────────────────────────────────
+  const isTied    = isFinished && (room?.tied ?? false);
+  const tiedMe    = isTied && (room?.tiedPlayers ?? []).includes(myPid);
+
   // ── Game over overlay ──────────────────────────────────────────────────────
   const finishedOverlay = isFinished && (
-    <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
+    <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
       <div className="bg-white border border-gray-200 rounded-2xl p-8 text-center max-w-sm w-full shadow-xl">
-        <div className={`text-5xl font-black mb-2 ${iWon ? 'text-red-600' : 'text-gray-400'}`}>
-          {iWon ? 'You Win!' : `${winner?.name ?? 'Someone'} Wins`}
+        <div className={`text-5xl font-black mb-2 ${
+          isTied
+            ? (tiedMe ? 'text-yellow-500' : 'text-gray-400')
+            : (iWon   ? 'text-red-600'    : 'text-gray-400')
+        }`}>
+          {isTied
+            ? (tiedMe ? "It's a Tie!" : 'Tie Game')
+            : (iWon   ? 'You Win!'    : `${winner?.name ?? 'Someone'} Wins`)}
         </div>
         <p className="text-gray-500 text-sm mb-4">Final scores</p>
         <div className="flex flex-col gap-2 mb-6">
@@ -314,8 +333,8 @@ function GamePageInner({ params }: PageProps) {
         </div>
       )}
 
-      {/* ── Main: cup pool + throw mechanic ────────────────────────────── */}
-      <ThrowMechanic
+      {/* ── Main: 3D cup pool + throw mechanic ─────────────────────────── */}
+      <GameScene3D
         cups={room.sharedCups}
         isMyTurn={isMyTurn}
         onThrow={handleThrow}

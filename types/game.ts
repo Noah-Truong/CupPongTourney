@@ -24,6 +24,8 @@ export interface GameRoom {
   status: 'waiting' | 'playing' | 'finished';
   currentPlayerIndex: number;
   turnState: TurnState;
-  winner: string | null;       // persistentId of winner
+  winner: string | null;       // persistentId of winner (null on tie)
+  tied: boolean;               // true when multiple players share the top score
+  tiedPlayers: string[];       // persistentIds of tied players (empty unless tied)
   gameLog: string[];
 }
