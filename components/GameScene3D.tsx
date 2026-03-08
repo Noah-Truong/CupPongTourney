@@ -9,21 +9,21 @@ import {
 import { Cup } from '@/types/game';
 
 // ── Scene geometry ────────────────────────────────────────────────────────────
-const TABLE_HW    = 2.0;
+const TABLE_HW    = 2.8;   // widened so 8-player far row (10 cups) stays on table
 const TABLE_DEPTH = 11.0;
 const TABLE_THICK = 0.10;
 const TABLE_Y     = 0;
 
 const CUP_FAR_Z   = -3.4;
 const CUP_NEAR_Z  = -1.0;
-const CUP_SPACING = 0.52;
+const CUP_SPACING = 0.58;  // 0.52 → 0.58: slightly more breathing room between cups
 const CUP_H       = 0.46;
-const CUP_TOP_R   = 0.185;
-const CUP_BOT_R   = 0.115;
+const CUP_TOP_R   = 0.205; // 0.185 → 0.205: wider opening for more margin of error
+const CUP_BOT_R   = 0.125; // 0.115 → 0.125: proportional to top radius
 const CUP_SEGS    = 24;
 const CUP_RIM_Y   = TABLE_Y + CUP_H;   // absolute Y of the cup's rim opening
 
-const BALL_R      = 0.105;
+const BALL_R      = 0.088; // 0.105 → 0.088: smaller ball → cups feel more open
 const BALL_START  = new THREE.Vector3(0, TABLE_Y + BALL_R + 0.01, 4.0);
 const ARC_HEIGHT  = 2.3;
 const FLIGHT_S    = 0.90;   // ball flight to cup rim
