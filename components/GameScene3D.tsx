@@ -34,9 +34,10 @@ const CAM_POS     = [0, 2.5, 5.8] as const;
 const CAM_TARGET  = [0, 0.15, -1.0] as const;
 const CAM_FOV     = 58;
 
-const MIN_SWIPE   = 80;     // px  — requires a committed throw gesture
-const MIN_VEL     = 0.18;   // px/ms — slow drags rejected (ball has weight)
-const MAX_VEL     = 2.00;   // px/ms — full-power throw velocity (wider range = more granularity)
+const MIN_SWIPE      = 20;    // px  — absolute jitter floor (not power-related)
+const MIN_DIST_NORM  = 0.08;  // fraction of screen height → minimum throw distance
+const MAX_DIST_NORM  = 0.55;  // fraction of screen height → full-power throw
+const MIN_VEL_JITTER = 0.02;  // px/ms — rejects zero-duration accidental taps only
 
 // ── Props ─────────────────────────────────────────────────────────────────────
 interface Props {
@@ -519,17 +520,16 @@ export default function GameScene3D({ cups, isMyTurn, onThrow, lastThrow }: Prop
   }, [size.w, size.h]);
 
   // ── Aim + throw-power computation ───────────────────────────────────────────
-  // - Swipe direction: ray-cast onto cup-rim plane → raw 3D landing point.
-  // - Throw power: derived from swipe velocity. Weak throws physically fall short
-  //   (effective landing scaled toward ball start), so far cups need real effort.
-  // - Arc / flight speed: fast swipe = high arc + quick flight; slow = flat + slow.
-  // - No aim assist: accuracy is purely how close the landing lands to a cup.
-  const computeAim = useCallback((dx: number, dy: number, vel: number) => {
+  // Power = f(swipe distance / screen height) so behaviour is identical on every
+  // device regardless of pixel density or physical size.
+  // Quadratic curve: small distance → barely any power; long swipe → full power.
+  //   8% of screen H →  0%    20% → 4%    35% → 22%
+  //  45% of screen H → 49%   55% → 100%
+  const computeAim = useCallback((dx: number, dy: number) => {
     const d = Math.hypot(dx, dy);
     if (d < MIN_SWIPE) return null;
 
-    // Only accept upward throws: the upward component must be at least 50% of
-    // the horizontal component. Prevents sideways flicks from registering.
+    // Only accept upward throws: upward component must be ≥ 50% of horizontal.
     if (dy > -Math.abs(dx) * 0.5) return null;
 
     const dir   = { x: dx / d, y: dy / d };
@@ -542,17 +542,17 @@ export default function GameScene3D({ cups, isMyTurn, onThrow, lastThrow }: Prop
     const rawLnd = swipeRayToPlane(dir, b2d, projCam, w, h, CUP_RIM_Y);
     if (!rawLnd) return null;
 
-    // Quadratic velocity → power curve (exponent 2.0).
-    // Unlike sub-linear curves, quadratic gives small gains for small speed
-    // increases and large gains only when you really commit to the throw.
-    // This creates granular, predictable control across the full velocity range:
-    //   0.18 px/ms →  0%   0.80 → 13%   1.20 → 33%
-    //   1.40 px/ms → 46%   1.60 → 61%   1.80 → 77%   2.00 → 100%
+    // Normalise swipe distance to screen height — device-independent power input.
+    const distNorm   = d / h;
     const throwPower = Math.min(1, Math.max(0,
-      Math.pow((vel - MIN_VEL) / (MAX_VEL - MIN_VEL), 2.0),
+      Math.pow(
+        (distNorm - MIN_DIST_NORM) / (MAX_DIST_NORM - MIN_DIST_NORM),
+        2.0,   // quadratic: gradual at short distances, steep at long ones
+      ),
     ));
 
-    // Distance scales linearly with power — no hidden multipliers.
+    // Scale effective landing by power — short swipes land short, long swipes
+    // reach the far end. Not 1:1: quadratic means doubling distance ≠ doubling range.
     const effX = lerp(BALL_START.x, rawLnd.x, throwPower);
     const effZ = lerp(BALL_START.z, rawLnd.z, throwPower);
 
@@ -612,10 +612,10 @@ export default function GameScene3D({ cups, isMyTurn, onThrow, lastThrow }: Prop
     const dx  = e.clientX - sx;
     const dy  = e.clientY - sy;
     const dt  = Math.max(1, performance.now() - st);
-    const vel = Math.hypot(dx, dy) / dt;
-    if (vel < MIN_VEL) return;
+    // Tiny velocity floor only — rejects zero-duration accidental taps, nothing more.
+    if (Math.hypot(dx, dy) / dt < MIN_VEL_JITTER) return;
 
-    const aim = computeAim(dx, dy, vel);
+    const aim = computeAim(dx, dy);
     if (!aim) return;
 
     localThrowRef.current = true;
