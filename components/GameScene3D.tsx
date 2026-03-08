@@ -36,7 +36,7 @@ const CAM_FOV     = 58;
 
 const MIN_SWIPE   = 80;     // px  — requires a committed throw gesture
 const MIN_VEL     = 0.18;   // px/ms — slow drags rejected (ball has weight)
-const MAX_VEL     = 1.60;   // px/ms — full-power throw velocity
+const MAX_VEL     = 2.00;   // px/ms — full-power throw velocity (wider range = more granularity)
 
 // ── Props ─────────────────────────────────────────────────────────────────────
 interface Props {
@@ -542,17 +542,19 @@ export default function GameScene3D({ cups, isMyTurn, onThrow, lastThrow }: Prop
     const rawLnd = swipeRayToPlane(dir, b2d, projCam, w, h, CUP_RIM_Y);
     if (!rawLnd) return null;
 
-    // Throw power in [0, 1] from velocity. Curve is sub-linear so the mid-range
-    // feels meaningful — a moderate swipe gives ~0.55 power, max needs full speed.
+    // Quadratic velocity → power curve (exponent 2.0).
+    // Unlike sub-linear curves, quadratic gives small gains for small speed
+    // increases and large gains only when you really commit to the throw.
+    // This creates granular, predictable control across the full velocity range:
+    //   0.18 px/ms →  0%   0.80 → 13%   1.20 → 33%
+    //   1.40 px/ms → 46%   1.60 → 61%   1.80 → 77%   2.00 → 100%
     const throwPower = Math.min(1, Math.max(0,
-      Math.pow((vel - MIN_VEL) / (MAX_VEL - MIN_VEL), 0.70),
+      Math.pow((vel - MIN_VEL) / (MAX_VEL - MIN_VEL), 2.0),
     ));
 
-    // Scale effective landing by power. Power < ~0.88 means the ball falls short.
-    // Players must swing hard to reach the far cups.
-    const powerFactor = Math.min(1, throwPower / 0.88);
-    const effX = lerp(BALL_START.x, rawLnd.x, powerFactor);
-    const effZ = lerp(BALL_START.z, rawLnd.z, powerFactor);
+    // Distance scales linearly with power — no hidden multipliers.
+    const effX = lerp(BALL_START.x, rawLnd.x, throwPower);
+    const effZ = lerp(BALL_START.z, rawLnd.z, throwPower);
 
     // Nearest cup to the power-adjusted landing
     let best = avail[0], bestDist = Infinity;
